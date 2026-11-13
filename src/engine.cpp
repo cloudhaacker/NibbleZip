@@ -1,0 +1,1036 @@
+#include "engine.h"
+#include "platform.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <set>
+#include <thread>
+
+#include "7zTypes.h"
+#include "7zCrc.h"
+#include "Alloc.h"
+#include "Lzma2Dec.h"
+#include "Lzma2Enc.h"
+#include <zlib.h>
+
+namespace nz {
+namespace {
+
+// ---------------------------------------------------------------- utilities
+static int g_cpN = -1, g_cpCount = 0;
+// Crash-injection checkpoints, used by the test-suite to kill the process at every stage.
+static void CP(const char* name) {
+    if (g_cpN < 0) return;
+    if (++g_cpCount == g_cpN) { fprintf(stderr, "CRASH-INJECT %d (%s)\n", g_cpCount, name); fflush(stderr); std::_Exit(77); }
+}
+
+struct Buf {
+    std::vector<uint8_t> b;
+    void u8(uint8_t v) { b.push_back(v); }
+    void u16(uint16_t v) { u8((uint8_t)v); u8((uint8_t)(v >> 8)); }
+    void u32(uint32_t v) { u16((uint16_t)v); u16((uint16_t)(v >> 16)); }
+    void u64(uint64_t v) { u32((uint32_t)v); u32((uint32_t)(v >> 32)); }
+    void bytes(const void* p, size_t n) { const uint8_t* q = (const uint8_t*)p; b.insert(b.end(), q, q + n); }
+    void str(const std::string& s) { u32((uint32_t)s.size()); bytes(s.data(), s.size()); }
+};
+struct Rd {
+    const uint8_t* p; size_t n; size_t pos = 0; bool bad = false;
+    Rd(const uint8_t* p_, size_t n_) : p(p_), n(n_) {}
+    uint8_t u8() { if (pos + 1 > n) { bad = true; return 0; } return p[pos++]; }
+    uint16_t u16() { uint16_t a = u8(); return (uint16_t)(a | (u8() << 8)); }
+    uint32_t u32() { uint32_t a = u16(); return a | ((uint32_t)u16() << 16); }
+    uint64_t u64() { uint64_t a = u32(); return a | ((uint64_t)u32() << 32); }
+    std::string str() { uint32_t l = u32(); if (bad || pos + l > n) { bad = true; return ""; } std::string s((const char*)p + pos, l); pos += l; return s; }
+};
+
+static void crcInit() { static bool done = false; if (!done) { CrcGenerateTable(); done = true; } }
+static uint64_t worstCase(uint64_t n) { return n + n / 8192 + 65536; }
+
+struct Entry {
+    std::string src, rel;
+    uint64_t size = 0, mtime = 0;
+    uint32_t attr = 0, crc = 0;
+    uint64_t lfh = 0, csize = 0;   // ZIP only
+    uint8_t method = 8, z64 = 0, isDir = 0;
+};
+struct Folder { uint64_t packSize = 0; uint8_t prop = 0; size_t first = 0, count = 0; };
+struct PartState { bool active = false; Entry e; uint64_t offset = 0; uint32_t crcState = 0; uint64_t packStart = 0; uint8_t prop = 0; };
+struct State {
+    std::vector<Entry> entries;
+    std::vector<Folder> folders;
+    std::vector<Entry> empties;
+    uint64_t dataEnd = 0;
+    PartState part;
+};
+struct JHeader { int format = 0, level = 1; bool eat = true; std::string archive; std::vector<std::string> inputs; };
+
+const uint32_t JMAGIC = 0x314A5A4E; // "NZJ1"
+enum { R_HEADER = 1, R_BATCH = 2, R_PART = 3, R_EMPTY = 4 };
+
+static void putEntry(Buf& b, const Entry& e) {
+    b.str(e.src); b.str(e.rel); b.u64(e.size); b.u64(e.mtime); b.u32(e.attr); b.u32(e.crc);
+    b.u64(e.lfh); b.u64(e.csize); b.u8(e.method); b.u8(e.z64); b.u8(e.isDir);
+}
+static Entry getEntry(Rd& r) {
+    Entry e; e.src = r.str(); e.rel = r.str(); e.size = r.u64(); e.mtime = r.u64(); e.attr = r.u32(); e.crc = r.u32();
+    e.lfh = r.u64(); e.csize = r.u64(); e.method = r.u8(); e.z64 = r.u8(); e.isDir = r.u8();
+    return e;
+}
+
+// Replays journal bytes. Returns the length of the valid prefix (0 if no usable header).
+static size_t parseJournal(const std::vector<uint8_t>& b, JHeader& h, State& st) {
+    st = State(); h = JHeader();
+    size_t pos = 0; bool haveHeader = false;
+    while (pos + 8 <= b.size()) {
+        Rd fr(b.data() + pos, 8);
+        uint32_t len = fr.u32(), crc = fr.u32();
+        if (len == 0 || len > (1u << 30) || pos + 8 + len > b.size()) break;
+        const uint8_t* pl = b.data() + pos + 8;
+        if (CrcCalc(pl, len) != crc) break;
+        Rd r(pl, len);
+        uint8_t type = r.u8();
+        if (!haveHeader) {
+            if (type != R_HEADER || r.u32() != JMAGIC) break;
+            h.format = r.u8(); h.level = r.u8(); h.eat = r.u8() != 0; h.archive = r.str();
+            uint32_t n = r.u32();
+            for (uint32_t i = 0; i < n && !r.bad; i++) h.inputs.push_back(r.str());
+            if (r.bad) break;
+            st.dataEnd = h.format == F7Z ? 32 : 0;
+            haveHeader = true;
+        } else if (type == R_BATCH) {
+            uint64_t dataEnd = r.u64(), packSize = r.u64(); uint8_t prop = r.u8(); uint32_t n = r.u32();
+            std::vector<Entry> es;
+            for (uint32_t i = 0; i < n && !r.bad; i++) es.push_back(getEntry(r));
+            if (r.bad) break;
+            Folder f; f.packSize = packSize; f.prop = prop; f.first = st.entries.size(); f.count = es.size();
+            for (auto& e : es) st.entries.push_back(std::move(e));
+            st.folders.push_back(f);
+            st.dataEnd = dataEnd;
+        } else if (type == R_PART) {
+            uint64_t dataEnd = r.u64(); Entry e = getEntry(r);
+            uint64_t off = r.u64(); uint32_t crcState = r.u32(); uint64_t packStart = r.u64(); uint8_t prop = r.u8();
+            if (r.bad) break;
+            st.dataEnd = dataEnd;
+            if (off >= e.size) {
+                e.crc = CRC_GET_DIGEST(crcState);
+                Folder f; f.packSize = dataEnd - packStart; f.prop = prop; f.first = st.entries.size(); f.count = 1;
+                st.entries.push_back(std::move(e)); st.folders.push_back(f);
+                st.part = PartState();
+            } else {
+                st.part.active = true; st.part.e = std::move(e); st.part.offset = off; st.part.crcState = crcState;
+                st.part.packStart = packStart; st.part.prop = prop;
+            }
+        } else if (type == R_EMPTY) {
+            uint32_t n = r.u32();
+            std::vector<Entry> es;
+            for (uint32_t i = 0; i < n && !r.bad; i++) es.push_back(getEntry(r));
+            if (r.bad) break;
+            for (auto& e : es) st.empties.push_back(std::move(e));
+        } else break;
+        pos += 8 + len;
+    }
+    return haveHeader ? pos : 0;
+}
+
+static bool readAll(const std::string& path, std::vector<uint8_t>& out) {
+    out.clear();
+    plat::File f;
+    if (!f.open(path, plat::OpenRead)) return false;
+    uint64_t sz = 0; if (!f.size(sz)) return false;
+    out.resize((size_t)sz); size_t got = 0;
+    if (sz && !f.readAt(0, out.data(), out.size(), got)) return false;
+    out.resize(got);
+    return true;
+}
+
+static std::string mirrorDir() { return plat::join(plat::appDataDir(), "journals"); }
+static std::string mirrorPathFor(const std::string& archive) {
+    std::string k = plat::pathKey(archive);
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : k) { h ^= c; h *= 1099511628211ull; }
+    char buf[32]; snprintf(buf, sizeof(buf), "%016llx.nzj", (unsigned long long)h);
+    return plat::join(mirrorDir(), buf);
+}
+
+// Journal is written twice: next to the archive and in the app-data folder.
+struct Journal {
+    plat::File a, b; uint64_t pos = 0; std::string pa, pb; bool haveB = false;
+    bool start(const std::string& archive, const std::vector<uint8_t>& existing) {
+        pa = journalPathFor(archive); pb = mirrorPathFor(archive);
+        if (!a.open(pa, plat::OpenRWAlways)) return false;
+        plat::makeDirs(mirrorDir());
+        haveB = b.open(pb, plat::OpenRWAlways);
+        if (!existing.empty() && !a.writeAt(0, existing.data(), existing.size())) return false;
+        if (!a.truncate(existing.size()) || !a.flush()) return false;
+        if (haveB) haveB = (existing.empty() || b.writeAt(0, existing.data(), existing.size())) && b.truncate(existing.size()) && b.flush();
+        pos = existing.size();
+        return true;
+    }
+    bool append(const Buf& payload) {
+        Buf fr; fr.u32((uint32_t)payload.b.size()); fr.u32(CrcCalc(payload.b.data(), payload.b.size()));
+        fr.bytes(payload.b.data(), payload.b.size());
+        if (!a.writeAt(pos, fr.b.data(), fr.b.size()) || !a.flush()) return false;
+        if (haveB) haveB = b.writeAt(pos, fr.b.data(), fr.b.size()) && b.flush();
+        pos += fr.b.size();
+        return true;
+    }
+    void destroy() { a.close(); b.close(); plat::removeFile(pa); plat::removeFile(pb); }
+};
+
+// Loads whichever journal copy has the longer valid prefix.
+static bool loadJournal(const std::string& archive, JHeader& h, State& st, std::vector<uint8_t>& bytes) {
+    std::vector<uint8_t> ba, bb; JHeader ha, hb; State sa, sb;
+    size_t la = 0, lb = 0;
+    if (readAll(journalPathFor(archive), ba)) la = parseJournal(ba, ha, sa);
+    if (readAll(mirrorPathFor(archive), bb)) {
+        lb = parseJournal(bb, hb, sb);
+        if (lb && !plat::samePath(hb.archive, archive)) lb = 0;
+    }
+    if (!la && !lb) return false;
+    if (la >= lb) { h = ha; st = std::move(sa); ba.resize(la); bytes = std::move(ba); }
+    else { h = hb; st = std::move(sb); bb.resize(lb); bytes = std::move(bb); }
+    return true;
+}
+
+// ---------------------------------------------------------------- scanning
+struct PlanFile { std::string src, rel; uint64_t size = 0, mtime = 0; uint32_t attr = 0; };
+struct Plan {
+    std::vector<PlanFile> files;
+    std::vector<PlanFile> dirs;
+    std::vector<std::string> skipped;
+    uint64_t total = 0, largest = 0;
+};
+
+static void scanDir(const std::string& dir, const std::string& rel, const std::set<std::string>& exclude, Plan& plan) {
+    std::vector<plat::DirEnt> ents;
+    if (!plat::listDir(dir, ents)) { plan.skipped.push_back("Could not read folder: " + dir); return; }
+    for (auto& e : ents) {
+        std::string p = plat::join(dir, e.name), r = rel + "/" + e.name;
+        if (e.st.isLink) { plan.skipped.push_back("Skipped link/cloud placeholder: " + p); continue; }
+        if (e.st.isDir) {
+            PlanFile d; d.src = p; d.rel = r; d.mtime = e.st.mtime; d.attr = e.st.attr;
+            plan.dirs.push_back(d);
+            scanDir(p, r, exclude, plan);
+        } else {
+            if (exclude.count(plat::pathKey(p))) continue;
+            PlanFile f; f.src = p; f.rel = r; f.size = e.st.size; f.mtime = e.st.mtime; f.attr = e.st.attr;
+            plan.total += f.size; plan.largest = std::max(plan.largest, f.size);
+            plan.files.push_back(std::move(f));
+        }
+    }
+}
+
+static bool scan(const std::vector<std::string>& inputs, const std::string& archive, Plan& plan, std::string& err, bool allowMissing) {
+    std::set<std::string> exclude;
+    exclude.insert(plat::pathKey(archive));
+    exclude.insert(plat::pathKey(journalPathFor(archive)));
+    std::set<std::string> names;
+    for (auto& in0 : inputs) {
+        std::string in = plat::absPath(in0);
+        plat::Stat st;
+        if (!plat::stat(in, st)) {
+            if (allowMissing) continue;   // already eaten in an earlier session
+            err = "Not found: " + in; return false;
+        }
+        std::string name = plat::baseName(in);
+        if (name.empty()) { err = "Cannot archive a whole drive root: " + in; return false; }
+        if (!names.insert(plat::pathKey("/" + name)).second) { err = "Two selected items share the name \"" + name + "\""; return false; }
+        if (st.isLink) { plan.skipped.push_back("Skipped link/cloud placeholder: " + in); continue; }
+        if (st.isDir) {
+            PlanFile d; d.src = in; d.rel = name; d.mtime = st.mtime; d.attr = st.attr;
+            plan.dirs.push_back(d);
+            scanDir(in, name, exclude, plan);
+        } else {
+            if (exclude.count(plat::pathKey(in))) continue;
+            PlanFile f; f.src = in; f.rel = name; f.size = st.size; f.mtime = st.mtime; f.attr = st.attr;
+            plan.total += f.size; plan.largest = std::max(plan.largest, f.size);
+            plan.files.push_back(std::move(f));
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- step sizing
+struct StepCfg { uint32_t dict = 0; uint64_t block = 0; int blockThreads = 1, totalThreads = 1; uint64_t step = 0; int lzLevel = 5, zLevel = 6; };
+
+static StepCfg makeCfg(const Options& o, uint64_t freeBytes) {
+    static const int lzLevels[4] = {3, 5, 7, 9};
+    static const uint32_t dicts[4] = {4u << 20, 16u << 20, 32u << 20, 64u << 20};
+    static const uint64_t blocks[4] = {16ull << 20, 64ull << 20, 128ull << 20, 192ull << 20};
+    static const int zLevels[4] = {3, 6, 9, 9};
+    int lv = std::min(3, std::max(0, o.level));
+    StepCfg c; unsigned cpus = plat::cpuCount();
+    if (const char* e = getenv("NIBBLEZIP_CPUS")) { int v = atoi(e); if (v > 0) cpus = (unsigned)v; }
+    c.lzLevel = lzLevels[lv]; c.zLevel = zLevels[lv]; c.dict = dicts[lv];
+    if (o.format == F7Z) {
+        c.block = blocks[lv];
+        uint64_t budget = plat::physMemory() / 2;
+        uint64_t per = 3 * c.block + 12ull * c.dict;
+        int t = (int)std::max<uint64_t>(1, budget / per);
+        t = std::min(t, (int)std::max(1u, cpus / 2)); t = std::min(t, 8);
+        while (t > 1 && (uint64_t)t * c.block > (1ull << 30)) t--;
+        c.blockThreads = t; c.totalThreads = (int)std::min<unsigned>(cpus, (unsigned)t * 2);
+    } else {
+        c.block = 8ull << 20;
+        c.totalThreads = (int)std::min(cpus, 16u);
+        c.blockThreads = std::max(1, std::min(c.totalThreads * 2, 16));
+    }
+    if (o.testStep) { c.block = o.testStep; c.blockThreads = 1; if (o.format == F7Z) c.dict = (uint32_t)std::min<uint64_t>(c.dict, std::max<uint64_t>(o.testStep, 4096)); }
+    // Shrink the step until one worst-case step fits in the free space.
+    const uint64_t margin = 16ull << 20;
+    while (!o.testStep && worstCase((uint64_t)c.blockThreads * c.block) + margin > freeBytes) {
+        if (c.blockThreads > 1) c.blockThreads--;
+        else if (c.block > (4ull << 20)) c.block /= 2;
+        else break;
+    }
+    c.step = (uint64_t)c.blockThreads * c.block;
+    return c;
+}
+
+// ---------------------------------------------------------------- codecs
+struct Ctx;
+static void tick(Ctx& c, bool force);
+
+struct OutVec { ISeqOutStream vt; std::vector<uint8_t>* v; };
+static size_t outWrite(ISeqOutStreamPtr pp, const void* data, size_t size) {
+    OutVec* o = Z7_CONTAINER_FROM_VTBL(pp, OutVec, vt);
+    try { o->v->insert(o->v->end(), (const uint8_t*)data, (const uint8_t*)data + size); } catch (...) { return 0; }
+    return size;
+}
+
+struct Ctx {
+    Options opt; Callbacks* cb = nullptr; State st; plat::File arc; Journal j; Progress pr; Result res;
+    StepCfg cfg; std::string archive, arcDir; int stop = 0; bool holes = true;
+    uint64_t stepBase = 0, stepOut = 0; uint64_t idxEst = 4096; bool journalBroken = false;
+    std::chrono::steady_clock::time_point lastTick;
+    std::vector<uint8_t> buf, out;
+    bool fail(const std::string& msg, bool resumable = true) { if (res.error.empty()) { res.error = msg; res.resumable = resumable; } return false; }
+    void warn(const std::string& w) { if (res.warnings.size() < 500) res.warnings.push_back(w); }
+};
+static void tick(Ctx& c, bool force) {
+    auto now = std::chrono::steady_clock::now();
+    if (!force && now - c.lastTick < std::chrono::milliseconds(120)) return;
+    c.lastTick = now;
+    c.pr.packedBytes = c.st.dataEnd + c.stepOut;
+    c.cb->progress(c.pr);
+}
+static void pollStop(Ctx& c) {
+    int m = c.cb->poll();
+    if (m == 1) c.stop = 1; else if (m == 2 && c.stop == 0) c.stop = 2;
+}
+
+struct Prog { ICompressProgress vt; Ctx* c; };
+static SRes progFn(ICompressProgressPtr pp, UInt64 inSize, UInt64 outSize) {
+    Prog* p = Z7_CONTAINER_FROM_VTBL(pp, Prog, vt);
+    Ctx& c = *p->c;
+    if (inSize != (UInt64)(Int64)-1) c.pr.doneBytes = c.stepBase + inSize;
+    if (outSize != (UInt64)(Int64)-1) c.stepOut = outSize;
+    tick(c, false);
+    pollStop(c);
+    return c.stop == 1 ? SZ_ERROR_PROGRESS : SZ_OK;
+}
+
+// Encodes one independent LZMA2 run. Non-final runs have the end marker removed so that
+// consecutive runs concatenate into one valid LZMA2 stream.
+static bool lzmaEncode(Ctx& c, const uint8_t* in, size_t n, bool final, bool reduce, std::vector<uint8_t>& out, uint8_t& prop) {
+    CLzma2EncHandle h = Lzma2Enc_Create(&g_Alloc, &g_BigAlloc);
+    if (!h) return c.fail("Out of memory creating the compressor");
+    CLzma2EncProps p; Lzma2EncProps_Init(&p);
+    p.lzmaProps.level = c.cfg.lzLevel; p.lzmaProps.dictSize = c.cfg.dict;
+    if (reduce) p.lzmaProps.reduceSize = n;
+    p.blockSize = c.cfg.block; p.numBlockThreads_Max = c.cfg.blockThreads; p.numTotalThreads = c.cfg.totalThreads;
+    SRes r = Lzma2Enc_SetProps(h, &p);
+    if (r != SZ_OK) { Lzma2Enc_Destroy(h); return c.fail("Compressor rejected its settings"); }
+    prop = Lzma2Enc_WriteProperties(h);
+    out.clear();
+    try { out.reserve(n / 2 + 65536); } catch (...) {}
+    OutVec ov; ov.vt.Write = outWrite; ov.v = &out;
+    Prog pg; pg.vt.Progress = progFn; pg.c = &c;
+    r = Lzma2Enc_Encode2(h, &ov.vt, nullptr, nullptr, nullptr, in, n, &pg.vt);
+    Lzma2Enc_Destroy(h);
+    if (r == SZ_ERROR_PROGRESS || c.stop == 1) { c.stop = 1; return false; }
+    if (r == SZ_ERROR_MEM) return c.fail("Not enough memory for this compression level. Try a lower level.");
+    if (r != SZ_OK) return c.fail("Compression failed (code " + std::to_string(r) + ")");
+    if (out.empty() || out.back() != 0) return c.fail("Internal error: compressed stream has no end marker");
+    if (!final) out.pop_back();
+    return true;
+}
+
+// Decompresses what was read back from disk and compares it byte-for-byte with the source.
+static bool lzmaVerify(const uint8_t* packed, size_t pn, uint8_t prop, const uint8_t* expect, size_t n, bool final) {
+    CLzma2Dec d; Lzma2Dec_CONSTRUCT(&d);
+    if (Lzma2Dec_Allocate(&d, prop, &g_Alloc) != SZ_OK) return false;
+    Lzma2Dec_Init(&d);
+    std::vector<uint8_t> tmp(1 << 20);
+    size_t sp = 0, dp = 0; bool ok = false;
+    for (;;) {
+        SizeT dl = tmp.size(), sl = pn - sp; ELzmaStatus status = LZMA_STATUS_NOT_SPECIFIED;
+        SRes r = Lzma2Dec_DecodeToBuf(&d, tmp.data(), &dl, packed + sp, &sl, LZMA_FINISH_ANY, &status);
+        if (r != SZ_OK) break;
+        if (dl) { if (dp + dl > n || memcmp(tmp.data(), expect + dp, dl) != 0) break; dp += dl; }
+        sp += sl;
+        if (status == LZMA_STATUS_FINISHED_WITH_MARK) { ok = final && dp == n && sp == pn; break; }
+        if (dl == 0 && sl == 0) { ok = !final && dp == n && sp == pn; break; }
+    }
+    Lzma2Dec_Free(&d, &g_Alloc);
+    return ok;
+}
+
+struct ZJob { const uint8_t* in = nullptr; size_t n = 0; int flush = Z_FINISH; std::vector<uint8_t> out; bool ok = false; };
+static void deflateOne(ZJob& j, int level) {
+    z_stream s; memset(&s, 0, sizeof(s));
+    if (deflateInit2(&s, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) return;
+    try { j.out.resize(deflateBound(&s, (uLong)j.n) + 64); } catch (...) { deflateEnd(&s); return; }
+    s.next_in = (Bytef*)j.in; s.avail_in = (uInt)j.n; s.next_out = j.out.data(); s.avail_out = (uInt)j.out.size();
+    int r = deflate(&s, j.flush);
+    bool ok = (j.flush == Z_FINISH) ? (r == Z_STREAM_END) : (r == Z_OK && s.avail_in == 0 && s.avail_out != 0);
+    j.out.resize(j.out.size() - s.avail_out);
+    deflateEnd(&s);
+    j.ok = ok;
+}
+static void runZJobs(std::vector<ZJob>& jobs, int level, int threads) {
+    std::atomic<size_t> next(0);
+    auto work = [&]() { for (;;) { size_t i = next.fetch_add(1); if (i >= jobs.size()) break; deflateOne(jobs[i], level); } };
+    int t = (int)std::min<size_t>((size_t)std::max(1, threads), jobs.size());
+    std::vector<std::thread> th;
+    for (int i = 1; i < t; i++) th.emplace_back(work);
+    work();
+    for (auto& x : th) x.join();
+}
+static bool inflateVerify(const uint8_t* packed, size_t pn, const uint8_t* expect, size_t n, bool final) {
+    z_stream s; memset(&s, 0, sizeof(s));
+    if (inflateInit2(&s, -15) != Z_OK) return false;
+    std::vector<uint8_t> tmp(1 << 20);
+    size_t dp = 0; bool ok = false;
+    s.next_in = (Bytef*)packed; s.avail_in = (uInt)pn;
+    for (;;) {
+        s.next_out = tmp.data(); s.avail_out = (uInt)tmp.size();
+        int r = inflate(&s, Z_NO_FLUSH);
+        size_t got = tmp.size() - s.avail_out;
+        if (got) { if (dp + got > n || memcmp(tmp.data(), expect + dp, got) != 0) break; dp += got; }
+        if (r == Z_STREAM_END) { ok = final && dp == n && s.avail_in == 0; break; }
+        if (r != Z_OK && r != Z_BUF_ERROR) break;
+        if (got == 0 && s.avail_in == 0) { ok = !final && dp == n; break; }
+        if (got == 0 && r == Z_BUF_ERROR) break;
+    }
+    inflateEnd(&s);
+    return ok;
+}
+
+// ---------------------------------------------------------------- 7z index
+static void w7num(Buf& b, uint64_t v) {
+    uint8_t first = 0, mask = 0x80; int i;
+    for (i = 0; i < 8; i++) {
+        if (v < ((uint64_t)1 << (7 * (i + 1)))) { first |= (uint8_t)(v >> (8 * i)); break; }
+        first |= mask; mask >>= 1;
+    }
+    b.u8(first);
+    for (; i > 0; i--) { b.u8((uint8_t)v); v >>= 8; }
+}
+static void utf16(Buf& b, const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        uint32_t c = (unsigned char)s[i]; int extra = 0;
+        if (c < 0x80) extra = 0; else if ((c & 0xE0) == 0xC0) { c &= 0x1F; extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { c &= 0x0F; extra = 2; } else if ((c & 0xF8) == 0xF0) { c &= 0x07; extra = 3; }
+        else { c = 0xFFFD; extra = 0; }
+        i++;
+        for (int k = 0; k < extra; k++) { if (i < s.size() && ((unsigned char)s[i] & 0xC0) == 0x80) c = (c << 6) | ((unsigned char)s[i++] & 0x3F); else { c = 0xFFFD; break; } }
+        if (c >= 0x10000) { c -= 0x10000; b.u16((uint16_t)(0xD800 + (c >> 10))); b.u16((uint16_t)(0xDC00 + (c & 0x3FF))); }
+        else b.u16((uint16_t)c);
+    }
+    b.u16(0);
+}
+static void bitvec(Buf& b, const std::vector<bool>& v) {
+    uint8_t cur = 0, mask = 0x80;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (v[i]) cur |= mask;
+        mask >>= 1;
+        if (!mask) { b.u8(cur); cur = 0; mask = 0x80; }
+    }
+    if (mask != 0x80) b.u8(cur);
+}
+
+static std::vector<uint8_t> build7zHeader(const State& st, const std::vector<Entry>& empties) {
+    Buf b;
+    size_t nStream = st.entries.size(), nAll = nStream + empties.size();
+    if (nAll == 0) return b.b;
+    b.u8(0x01);
+    if (!st.folders.empty()) {
+        b.u8(0x04);
+        b.u8(0x06); w7num(b, 0); w7num(b, st.folders.size());
+        b.u8(0x09); for (auto& f : st.folders) w7num(b, f.packSize);
+        b.u8(0x00);
+        b.u8(0x07); b.u8(0x0B); w7num(b, st.folders.size()); b.u8(0);
+        for (auto& f : st.folders) { w7num(b, 1); b.u8(0x21); b.u8(0x21); w7num(b, 1); b.u8(f.prop); }
+        b.u8(0x0C);
+        for (auto& f : st.folders) { uint64_t sum = 0; for (size_t i = 0; i < f.count; i++) sum += st.entries[f.first + i].size; w7num(b, sum); }
+        b.u8(0x00);
+        b.u8(0x08);
+        b.u8(0x0D); for (auto& f : st.folders) w7num(b, f.count);
+        b.u8(0x09); for (auto& f : st.folders) for (size_t i = 0; i + 1 < f.count; i++) w7num(b, st.entries[f.first + i].size);
+        b.u8(0x0A); b.u8(1); for (auto& e : st.entries) b.u32(e.crc);
+        b.u8(0x00);
+        b.u8(0x00);
+    }
+    b.u8(0x05); w7num(b, nAll);
+    if (!empties.empty()) {
+        std::vector<bool> es(nAll, false), ef;
+        for (size_t i = nStream; i < nAll; i++) es[i] = true;
+        for (auto& e : empties) ef.push_back(!e.isDir);
+        b.u8(0x0E); w7num(b, (nAll + 7) / 8); bitvec(b, es);
+        b.u8(0x0F); w7num(b, (ef.size() + 7) / 8); bitvec(b, ef);
+    }
+    Buf names;
+    for (auto& e : st.entries) utf16(names, e.rel);
+    for (auto& e : empties) utf16(names, e.rel);
+    b.u8(0x11); w7num(b, names.b.size() + 1); b.u8(0); b.bytes(names.b.data(), names.b.size());
+    b.u8(0x14); w7num(b, 2 + 8 * nAll); b.u8(1); b.u8(0);
+    for (auto& e : st.entries) b.u64(e.mtime);
+    for (auto& e : empties) b.u64(e.mtime);
+    b.u8(0x15); w7num(b, 2 + 4 * nAll); b.u8(1); b.u8(0);
+    for (auto& e : st.entries) b.u32(e.attr);
+    for (auto& e : empties) b.u32(e.attr);
+    b.u8(0x00);
+    b.u8(0x00);
+    return b.b;
+}
+static std::vector<uint8_t> build7zStart(uint64_t nextOff, uint64_t nextSize, uint32_t nextCrc) {
+    Buf t; t.u64(nextOff); t.u64(nextSize); t.u32(nextCrc);
+    Buf b; static const uint8_t sig[8] = {'7', 'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4};
+    b.bytes(sig, 8); b.u32(CrcCalc(t.b.data(), t.b.size())); b.bytes(t.b.data(), t.b.size());
+    return b.b;
+}
+
+// ---------------------------------------------------------------- ZIP index
+static void dosTime(uint64_t ft, uint16_t& d, uint16_t& t) {
+    d = (1 << 5) | 1; t = 0;
+    if (ft < 116444736000000000ull) return;
+    time_t tt = (time_t)((ft - 116444736000000000ull) / 10000000ull);
+    struct tm lt;
+#ifdef _WIN32
+    if (localtime_s(&lt, &tt) != 0) return;
+#else
+    if (!localtime_r(&tt, &lt)) return;
+#endif
+    if (lt.tm_year < 80) return;
+    d = (uint16_t)(((lt.tm_year - 80) << 9) | ((lt.tm_mon + 1) << 5) | lt.tm_mday);
+    t = (uint16_t)((lt.tm_hour << 11) | (lt.tm_min << 5) | (lt.tm_sec / 2));
+}
+static std::string zipName(const Entry& e) { return e.isDir ? e.rel + "/" : e.rel; }
+static void zipLFH(Buf& b, const Entry& e) {
+    std::string name = zipName(e); uint16_t d, t; dosTime(e.mtime, d, t);
+    b.u32(0x04034b50); b.u16(e.z64 ? 45 : 20); b.u16(0x0800); b.u16(e.method); b.u16(t); b.u16(d);
+    b.u32(e.crc); b.u32(e.z64 ? 0xFFFFFFFFu : (uint32_t)e.csize); b.u32(e.z64 ? 0xFFFFFFFFu : (uint32_t)e.size);
+    b.u16((uint16_t)name.size()); b.u16(e.z64 ? 20 : 0); b.bytes(name.data(), name.size());
+    if (e.z64) { b.u16(0x0001); b.u16(16); b.u64(e.size); b.u64(e.csize); }
+}
+
+static std::vector<uint8_t> buildZipIndex(const std::vector<const Entry*>& all, uint64_t cdOffset) {
+    Buf b;
+    for (const Entry* pe : all) {
+        const Entry& e = *pe;
+        std::string name = zipName(e); uint16_t d, t; dosTime(e.mtime, d, t);
+        bool offBig = e.lfh >= 0xFFFFFFFFull;
+        Buf x;
+        if (e.z64 || offBig) {
+            Buf z; if (e.z64) { z.u64(e.size); z.u64(e.csize); } if (offBig) z.u64(e.lfh);
+            x.u16(0x0001); x.u16((uint16_t)z.b.size()); x.bytes(z.b.data(), z.b.size());
+        }
+        x.u16(0x000A); x.u16(32); x.u32(0); x.u16(1); x.u16(24); x.u64(e.mtime); x.u64(e.mtime); x.u64(e.mtime);
+        b.u32(0x02014b50); b.u16(40); b.u16((e.z64 || offBig) ? 45 : 20); b.u16(0x0800); b.u16(e.method); b.u16(t); b.u16(d);
+        b.u32(e.crc); b.u32(e.z64 ? 0xFFFFFFFFu : (uint32_t)e.csize); b.u32(e.z64 ? 0xFFFFFFFFu : (uint32_t)e.size);
+        b.u16((uint16_t)name.size()); b.u16((uint16_t)x.b.size()); b.u16(0); b.u16(0); b.u16(0);
+        b.u32((e.attr & 0xFFFF) | (e.isDir ? 0x10 : 0)); b.u32(offBig ? 0xFFFFFFFFu : (uint32_t)e.lfh);
+        b.bytes(name.data(), name.size()); b.bytes(x.b.data(), x.b.size());
+    }
+    uint64_t cdSize = b.b.size(), n = all.size();
+    bool z64 = n >= 0xFFFF || cdSize >= 0xFFFFFFFFull || cdOffset >= 0xFFFFFFFFull;
+    if (z64) {
+        uint64_t z64pos = cdOffset + cdSize;
+        b.u32(0x06064b50); b.u64(44); b.u16(45); b.u16(45); b.u32(0); b.u32(0); b.u64(n); b.u64(n); b.u64(cdSize); b.u64(cdOffset);
+        b.u32(0x07064b50); b.u32(0); b.u64(z64pos); b.u32(1);
+    }
+    b.u32(0x06054b50); b.u16(0); b.u16(0);
+    b.u16(z64 ? 0xFFFF : (uint16_t)n); b.u16(z64 ? 0xFFFF : (uint16_t)n);
+    b.u32(z64 ? 0xFFFFFFFFu : (uint32_t)cdSize); b.u32(z64 ? 0xFFFFFFFFu : (uint32_t)cdOffset); b.u16(0);
+    return b.b;
+}
+
+// Writes the archive index after the data so the file is a valid archive of everything committed so far.
+static bool writeIndex(Ctx& c, bool final) {
+    static const std::vector<Entry> none;
+    const std::vector<Entry>& empties = final ? c.st.empties : none;
+    if (c.opt.format == F7Z) {
+        std::vector<uint8_t> hdr = build7zHeader(c.st, empties);
+        if (!hdr.empty() && !c.arc.writeAt(c.st.dataEnd, hdr.data(), hdr.size())) return c.fail("Could not write archive index: " + plat::lastError());
+        if (!c.arc.truncate(c.st.dataEnd + hdr.size())) return c.fail("Could not size archive: " + plat::lastError());
+        if (!c.arc.flush()) return c.fail("Could not flush archive: " + plat::lastError());
+        CP("index-body");
+        std::vector<uint8_t> sh = build7zStart(c.st.dataEnd - 32, hdr.size(), hdr.empty() ? 0 : CrcCalc(hdr.data(), hdr.size()));
+        if (!c.arc.writeAt(0, sh.data(), sh.size()) || !c.arc.flush()) return c.fail("Could not write archive header: " + plat::lastError());
+        c.idxEst = hdr.size() + 4096;
+    } else {
+        Buf blk; std::vector<Entry> emp = empties; uint64_t pos = c.st.dataEnd;
+        for (auto& e : emp) { e.lfh = pos; e.method = 0; e.csize = 0; e.crc = 0; e.z64 = 0; size_t before = blk.b.size(); zipLFH(blk, e); pos += blk.b.size() - before; }
+        std::vector<const Entry*> all;
+        for (auto& e : c.st.entries) all.push_back(&e);
+        for (auto& e : emp) all.push_back(&e);
+        std::vector<uint8_t> cd = buildZipIndex(all, pos);
+        blk.bytes(cd.data(), cd.size());
+        if (!c.arc.writeAt(c.st.dataEnd, blk.b.data(), blk.b.size())) return c.fail("Could not write archive index: " + plat::lastError());
+        if (!c.arc.truncate(c.st.dataEnd + blk.b.size())) return c.fail("Could not size archive: " + plat::lastError());
+        if (!c.arc.flush()) return c.fail("Could not flush archive: " + plat::lastError());
+        c.idxEst = blk.b.size() + 4096;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- committing data
+// Writes c.out at the end of the archive data, forces it to disk and reads it back.
+// On return c.out holds what the disk returned.
+static bool commitData(Ctx& c) {
+    uint64_t fr = 0;
+    if (plat::freeSpace(c.arcDir, fr) && fr < c.out.size() + c.idxEst + (4ull << 20))
+        return c.fail("Not enough free space on the archive drive to continue (" + humanSize(fr) + " free). Free some space and resume.");
+    uint32_t crc = CrcCalc(c.out.data(), c.out.size());
+    if (!c.arc.writeAt(c.st.dataEnd, c.out.data(), c.out.size())) return c.fail("Write to archive failed: " + plat::lastError());
+    CP("data-written");
+    if (!c.arc.flush()) return c.fail("Flushing archive to disk failed: " + plat::lastError());
+    size_t got = 0;
+    if (!c.arc.readAt(c.st.dataEnd, c.out.data(), c.out.size(), got) || got != c.out.size()) return c.fail("Reading archive back failed: " + plat::lastError());
+    if (CrcCalc(c.out.data(), c.out.size()) != crc) return c.fail("Verification failed: archive data read back from disk does not match what was written. Nothing was deleted.");
+    return true;
+}
+
+// After a failed step the old index may have been overwritten; put it back when possible.
+static void restoreIndex(Ctx& c) {
+    if (c.st.part.active || c.journalBroken || !c.arc.isOpen()) return;
+    std::string keepErr = c.res.error; bool keepRes = c.res.resumable;
+    writeIndex(c, false);
+    c.res.error = keepErr; c.res.resumable = keepRes;
+}
+
+static void deleteSource(Ctx& c, const Entry& e) {
+    plat::Stat s;
+    if (!plat::stat(e.src, s)) return;
+    if (s.size != e.size || (!e.z64 && s.mtime != e.mtime)) { c.warn("Changed after it was archived, so it was kept: " + e.src); return; }
+    if (plat::removeFile(e.src)) c.pr.reclaimedBytes += e.size;
+    else c.warn("Archived but could not be deleted (" + plat::lastError() + "): " + e.src);
+}
+
+// Small files: gather up to one step of data, compress it together, verify, then delete the sources.
+static bool processBatch(Ctx& c, const std::vector<PlanFile>& files) {
+    c.buf.clear();
+    std::vector<Entry> ents; std::vector<size_t> offs;
+    for (auto& f : files) {
+        plat::Stat s; plat::File in;
+        auto skip = [&](const std::string& why) { c.warn(why + ": " + f.src); c.pr.totalBytes -= std::min(c.pr.totalBytes, f.size); if (c.pr.filesTotal) c.pr.filesTotal--; };
+        if (!plat::stat(f.src, s) || s.isDir || s.isLink) { skip("No longer available, skipped"); continue; }
+        if (s.size > f.size && s.size > c.cfg.step) { skip("Grew while the job was running, skipped"); continue; }
+        if (!in.open(f.src, plat::OpenRead)) { skip("In use or unreadable, skipped (" + plat::lastError() + ")"); continue; }
+        size_t at = c.buf.size(), got = 0;
+        try { c.buf.resize(at + (size_t)s.size); } catch (...) { return c.fail("Out of memory reading files"); }
+        if ((s.size && !in.readAt(0, c.buf.data() + at, (size_t)s.size, got)) || got != s.size) {
+            c.buf.resize(at); skip("Read error, skipped (" + plat::lastError() + ")"); continue;
+        }
+        Entry e; e.src = f.src; e.rel = f.rel; e.size = s.size; e.mtime = s.mtime; e.attr = s.attr;
+        e.crc = CrcCalc(c.buf.data() + at, (size_t)s.size);
+        if (s.size == 0) { bool dup = false; for (auto& x : c.st.empties) if (x.rel == e.rel) dup = true; if (!dup) c.st.empties.push_back(e); continue; }
+        ents.push_back(std::move(e)); offs.push_back(at);
+    }
+    if (ents.empty()) return true;
+    c.pr.current = ents.size() == 1 ? ents[0].rel : ents[0].rel + "  (+" + std::to_string(ents.size() - 1) + " more)";
+    c.stepBase = c.pr.doneBytes; c.stepOut = 0;
+    size_t n = c.buf.size();
+    Folder fo; fo.first = c.st.entries.size(); fo.count = ents.size();
+    if (c.opt.format == F7Z) {
+        if (!lzmaEncode(c, c.buf.data(), n, true, true, c.out, fo.prop)) return false;
+        fo.packSize = c.out.size();
+        if (!commitData(c)) return false;
+        if (!lzmaVerify(c.out.data(), c.out.size(), fo.prop, c.buf.data(), n, true))
+            return c.fail("Verification failed: decompressed data does not match the source files. Nothing was deleted.");
+    } else {
+        std::vector<ZJob> jobs(ents.size());
+        for (size_t i = 0; i < ents.size(); i++) { jobs[i].in = c.buf.data() + offs[i]; jobs[i].n = (size_t)ents[i].size; jobs[i].flush = Z_FINISH; }
+        runZJobs(jobs, c.cfg.zLevel, c.cfg.totalThreads);
+        c.out.clear();
+        std::vector<size_t> dataAt(ents.size());
+        for (size_t i = 0; i < ents.size(); i++) {
+            if (!jobs[i].ok) return c.fail("Compression failed for " + ents[i].rel);
+            Entry& e = ents[i];
+            bool store = jobs[i].out.size() >= e.size;
+            e.method = store ? 0 : 8; e.csize = store ? e.size : jobs[i].out.size(); e.lfh = c.st.dataEnd + c.out.size();
+            Buf h; zipLFH(h, e);
+            c.out.insert(c.out.end(), h.b.begin(), h.b.end());
+            dataAt[i] = c.out.size();
+            if (store) c.out.insert(c.out.end(), jobs[i].in, jobs[i].in + e.size);
+            else c.out.insert(c.out.end(), jobs[i].out.begin(), jobs[i].out.end());
+            std::vector<uint8_t>().swap(jobs[i].out);
+        }
+        fo.packSize = c.out.size();
+        if (!commitData(c)) return false;
+        for (size_t i = 0; i < ents.size(); i++) {
+            const Entry& e = ents[i]; const uint8_t* src = c.buf.data() + offs[i];
+            bool ok = e.method == 0 ? memcmp(c.out.data() + dataAt[i], src, (size_t)e.size) == 0
+                                    : inflateVerify(c.out.data() + dataAt[i], (size_t)e.csize, src, (size_t)e.size, true);
+            if (!ok) return c.fail("Verification failed for " + e.rel + ". Nothing was deleted.");
+        }
+    }
+    CP("batch-verified");
+    Buf rec; rec.u8(R_BATCH); rec.u64(c.st.dataEnd + c.out.size()); rec.u64(fo.packSize); rec.u8(fo.prop); rec.u32((uint32_t)ents.size());
+    for (auto& e : ents) putEntry(rec, e);
+    if (!c.j.append(rec)) { c.journalBroken = true; return c.fail("Could not write the journal: " + plat::lastError()); }
+    CP("batch-journaled");
+    c.st.dataEnd += c.out.size(); c.stepOut = 0;
+    for (auto& e : ents) c.st.entries.push_back(e);
+    c.st.folders.push_back(fo);
+    if (!writeIndex(c, false)) return false;
+    CP("batch-indexed");
+    c.pr.doneBytes = c.stepBase + n; c.pr.filesDone += ents.size();
+    if (c.opt.eat) for (auto& e : ents) { deleteSource(c, e); CP("batch-delete"); }
+    tick(c, true);
+    return true;
+}
+
+// Big files: compress one step at a time and release the already-archived part of the source.
+static bool processLarge(Ctx& c, const PlanFile& f, bool resuming) {
+    plat::File in; bool punch = c.opt.eat && c.holes;
+    if (!in.open(f.src, punch ? plat::OpenReadPunch : plat::OpenRead)) {
+        if (resuming) return c.fail("Cannot reopen the half-processed file " + f.src + ": " + plat::lastError());
+        if (punch && in.open(f.src, plat::OpenRead)) { punch = false; c.warn("No write access, so space is released only at the end: " + f.src); }
+        else { c.warn("In use or unreadable, skipped (" + plat::lastError() + "): " + f.src); c.pr.totalBytes -= std::min(c.pr.totalBytes, f.size); if (c.pr.filesTotal) c.pr.filesTotal--; return true; }
+    }
+    uint64_t size = 0;
+    if (!in.size(size)) return c.fail("Cannot read size of " + f.src);
+    PartState& p = c.st.part;
+    if (!resuming) {
+        if (size <= c.cfg.step) { in.close(); std::vector<PlanFile> one(1, f); return processBatch(c, one); }
+        p = PartState(); p.active = true;
+        p.e.src = f.src; p.e.rel = f.rel; p.e.size = size; p.e.mtime = f.mtime; p.e.attr = f.attr; p.e.z64 = 1; p.e.method = 8;
+        p.offset = 0; p.crcState = CRC_INIT_VAL; p.packStart = c.st.dataEnd; p.e.lfh = c.st.dataEnd;
+    } else if (size != p.e.size) {
+        return c.fail("The half-processed file changed size and cannot be continued: " + f.src, false);
+    }
+    c.pr.current = f.rel;
+    try { c.buf.resize((size_t)std::min<uint64_t>(c.cfg.step, size)); } catch (...) { return c.fail("Out of memory"); }
+    while (p.offset < size) {
+        pollStop(c);
+        if (c.stop == 1) return false;
+        size_t n = (size_t)std::min<uint64_t>(c.cfg.step, size - p.offset), got = 0;
+        bool final = p.offset + n == size, first = p.offset == 0;
+        if (!in.readAt(p.offset, c.buf.data(), n, got) || got != n) return c.fail("Read error in " + f.src + ": " + plat::lastError());
+        c.stepBase = c.pr.doneBytes; c.stepOut = 0;
+        size_t hdrLen = 0; uint8_t prop = 0;
+        if (c.opt.format == F7Z) {
+            if (!lzmaEncode(c, c.buf.data(), n, final, false, c.out, prop)) return false;
+            if (first) p.prop = prop;
+            else if (prop != p.prop) return c.fail("Compression settings changed since this file was started");
+            if (!commitData(c)) return false;
+            if (!lzmaVerify(c.out.data(), c.out.size(), prop, c.buf.data(), n, final))
+                return c.fail("Verification failed: decompressed data does not match the source. Nothing was released.");
+        } else {
+            size_t nb = (n + c.cfg.block - 1) / c.cfg.block;
+            std::vector<ZJob> jobs(nb);
+            for (size_t i = 0; i < nb; i++) {
+                size_t a = i * (size_t)c.cfg.block;
+                jobs[i].in = c.buf.data() + a; jobs[i].n = std::min<size_t>((size_t)c.cfg.block, n - a);
+                jobs[i].flush = (final && i + 1 == nb) ? Z_FINISH : Z_FULL_FLUSH;
+            }
+            runZJobs(jobs, c.cfg.zLevel, c.cfg.totalThreads);
+            c.out.clear();
+            if (first) { Buf h; zipLFH(h, p.e); c.out = h.b; hdrLen = c.out.size(); }
+            for (auto& j : jobs) { if (!j.ok) return c.fail("Compression failed for " + f.rel); c.out.insert(c.out.end(), j.out.begin(), j.out.end()); std::vector<uint8_t>().swap(j.out); }
+            if (!commitData(c)) return false;
+            if (!inflateVerify(c.out.data() + hdrLen, c.out.size() - hdrLen, c.buf.data(), n, final))
+                return c.fail("Verification failed: decompressed data does not match the source. Nothing was released.");
+        }
+        CP("part-verified");
+        uint32_t crcState = CrcUpdate(p.crcState, c.buf.data(), n);
+        Entry e2 = p.e; e2.csize += c.out.size() - hdrLen;
+        uint64_t newEnd = c.st.dataEnd + c.out.size();
+        if (final && c.opt.format == FZIP) {
+            // Fill the real CRC and sizes into the local header written with the first step.
+            e2.crc = CRC_GET_DIGEST(crcState);
+            Buf h; zipLFH(h, e2);
+            if (!c.arc.writeAt(e2.lfh, h.b.data(), h.b.size()) || !c.arc.flush()) return c.fail("Could not update file header: " + plat::lastError());
+        }
+        Buf rec; rec.u8(R_PART); rec.u64(newEnd); putEntry(rec, e2); rec.u64(p.offset + n); rec.u32(crcState); rec.u64(p.packStart); rec.u8(p.prop);
+        if (!c.j.append(rec)) { c.journalBroken = true; return c.fail("Could not write the journal: " + plat::lastError()); }
+        CP("part-journaled");
+        c.st.dataEnd = newEnd; c.stepOut = 0; p.e = e2; p.crcState = crcState;
+        uint64_t prev = p.offset; p.offset += n;
+        c.pr.doneBytes = c.stepBase + n;
+        if (final) {
+            Entry e = p.e; e.crc = CRC_GET_DIGEST(crcState);
+            Folder fo; fo.packSize = c.st.dataEnd - p.packStart; fo.prop = p.prop; fo.first = c.st.entries.size(); fo.count = 1;
+            c.st.entries.push_back(e); c.st.folders.push_back(fo);
+            p = PartState();
+            if (!writeIndex(c, false)) return false;
+            CP("part-indexed");
+            in.close();
+            c.pr.filesDone++;
+            if (c.opt.eat) {
+                uint64_t before = c.pr.reclaimedBytes;
+                if (plat::removeFile(e.src)) c.pr.reclaimedBytes = before + (punch ? size - prev : size);
+                else c.warn("Archived but could not be deleted (" + plat::lastError() + "): " + e.src);
+            }
+            CP("part-deleted");
+            tick(c, true);
+            return true;
+        } else if (punch) {
+            uint64_t from = prev & ~((1ull << 20) - 1);
+            if (in.punchHole(from, p.offset - from)) c.pr.reclaimedBytes += n;
+            else { punch = false; c.warn("This drive would not release space inside " + f.src + "; it will be freed when the file is finished."); }
+            CP("part-punched");
+        }
+        tick(c, true);
+    }
+    return true;
+}
+
+static bool openArchiveNew(Ctx& c) {
+    if (!c.arc.open(c.archive, plat::OpenRWCreateNew)) return c.fail("Cannot create archive " + c.archive + ": " + plat::lastError(), false);
+    if (c.opt.format == F7Z) {
+        std::vector<uint8_t> sh = build7zStart(0, 0, 0);
+        if (!c.arc.writeAt(0, sh.data(), sh.size()) || !c.arc.flush()) return c.fail("Cannot write archive: " + plat::lastError(), false);
+        c.st.dataEnd = 32;
+    } else c.st.dataEnd = 0;
+    return true;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------- public API
+std::string journalPathFor(const std::string& archive) { return archive + ".nzj"; }
+
+std::string humanSize(uint64_t n) {
+    const char* u[] = {"bytes", "KB", "MB", "GB", "TB"};
+    double v = (double)n; int i = 0;
+    while (v >= 1024 && i < 4) { v /= 1024; i++; }
+    char b[64];
+    if (i == 0) snprintf(b, sizeof(b), "%llu bytes", (unsigned long long)n);
+    else snprintf(b, sizeof(b), v >= 100 ? "%.0f %s" : v >= 10 ? "%.1f %s" : "%.2f %s", v, u[i]);
+    return b;
+}
+
+Preflight preflight(const Options& opt) {
+    Preflight pf;
+    crcInit();
+    if (opt.inputs.empty()) { pf.error = "Nothing selected."; return pf; }
+    if (opt.archive.empty()) { pf.error = "Choose where to save the archive."; return pf; }
+    std::string archive = plat::absPath(opt.archive), dir = plat::parentDir(archive);
+    plat::Stat st;
+    if (!plat::stat(dir, st) || !st.isDir) { pf.error = "The archive folder does not exist: " + dir; return pf; }
+    if (plat::stat(archive, st)) { pf.error = "A file with that archive name already exists. Pick another name."; return pf; }
+    Plan plan; std::string err;
+    if (!scan(opt.inputs, archive, plan, err, false)) { pf.error = err; return pf; }
+    pf.totalBytes = plan.total; pf.files = plan.files.size(); pf.dirs = plan.dirs.size(); pf.largest = plan.largest;
+    for (auto& s : plan.skipped) if (pf.notes.size() < 20) pf.notes.push_back(s);
+    if (plan.files.empty() && plan.dirs.empty()) { pf.error = "Nothing to compress."; return pf; }
+    if (!plat::freeSpace(dir, pf.freeBytes)) { pf.error = "Cannot read free space of " + dir; return pf; }
+    std::string av = plat::volumeId(dir);
+    for (auto& in : opt.inputs) {
+        std::string a = plat::absPath(in);
+        if (plat::volumeId(a) != av) pf.sameVolume = false;
+        if (!plat::supportsHoles(a)) pf.holes = false;
+    }
+    StepCfg cfg = makeCfg(opt, pf.freeBytes);
+    pf.stepBytes = cfg.step;
+    const uint64_t margin = 16ull << 20;
+    uint64_t idx = 0;
+    for (auto& f : plan.files) idx += f.rel.size() * 2 + 64;
+    for (auto& d : plan.dirs) idx += d.rel.size() * 2 + 64;
+    if (opt.eat && pf.sameVolume) {
+        uint64_t unit = std::min(plan.total, cfg.step);
+        if (!pf.holes && plan.largest > cfg.step) unit = plan.largest;
+        pf.needBytes = worstCase(unit) + idx + margin;
+        if (pf.freeBytes < pf.needBytes) {
+            pf.error = "Not enough free space to start safely: " + humanSize(pf.needBytes) + " needed, " + humanSize(pf.freeBytes) + " free.";
+            return pf;
+        }
+        if (!pf.holes && plan.largest > cfg.step)
+            pf.notes.push_back("This drive cannot release space inside a file while it is being read, so each large file needs room for its compressed copy.");
+    } else {
+        pf.needBytes = worstCase(plan.total) + idx + margin;
+        if (opt.eat && !pf.sameVolume)
+            pf.notes.push_back("The archive is on a different drive from the files, so deleting them does not make room for it.");
+        if (pf.freeBytes < pf.needBytes)
+            pf.notes.push_back("If the data compresses poorly the archive drive may fill up (" + humanSize(pf.freeBytes) + " free). The job would stop safely and can be resumed.");
+    }
+    pf.ok = true;
+    return pf;
+}
+
+bool loadJob(const std::string& archive0, JobInfo& info) {
+    crcInit();
+    std::string archive = plat::absPath(archive0);
+    JHeader h; State st; std::vector<uint8_t> bytes;
+    if (!loadJournal(archive, h, st, bytes)) return false;
+    info = JobInfo();
+    info.archive = archive; info.opt.archive = archive; info.opt.format = h.format; info.opt.level = h.level; info.opt.eat = h.eat; info.opt.inputs = h.inputs;
+    info.midFile = st.part.active; info.midFileName = st.part.e.rel; info.filesDone = st.entries.size(); info.packedBytes = st.dataEnd;
+    return true;
+}
+
+std::vector<JobInfo> pendingJobs() {
+    crcInit();
+    std::vector<JobInfo> out; std::vector<plat::DirEnt> ents;
+    if (!plat::listDir(mirrorDir(), ents)) return out;
+    for (auto& e : ents) {
+        std::string p = plat::join(mirrorDir(), e.name);
+        std::vector<uint8_t> b; JHeader h; State st;
+        if (!readAll(p, b) || !parseJournal(b, h, st)) continue;
+        plat::Stat s;
+        if (!plat::stat(h.archive, s)) continue;
+        JobInfo ji;
+        if (loadJob(h.archive, ji)) out.push_back(ji);
+    }
+    return out;
+}
+
+Result run(const Options& opt0, Callbacks& cb) {
+    crcInit();
+    if (const char* e = getenv("NIBBLEZIP_CRASH_AT")) { g_cpN = atoi(e); g_cpCount = 0; }
+    Ctx c; c.opt = opt0; c.cb = &cb;
+    c.archive = plat::absPath(opt0.archive); c.arcDir = plat::parentDir(c.archive);
+    c.lastTick = std::chrono::steady_clock::now();
+    auto finish = [&]() -> Result { c.stepOut = 0; c.pr.packedBytes = c.st.dataEnd; c.res.final = c.pr; c.cb->progress(c.pr); return c.res; };
+
+    JHeader jh; std::vector<uint8_t> jbytes; State loaded;
+    bool resume = loadJournal(c.archive, jh, loaded, jbytes);
+    if (resume) {
+        plat::Stat as;
+        if (!plat::stat(c.archive, as)) {   // journal left over from an archive that no longer exists
+            plat::removeFile(journalPathFor(c.archive)); plat::removeFile(mirrorPathFor(c.archive));
+            resume = false; loaded = State();
+        }
+    }
+    if (resume) {
+        c.st = std::move(loaded);
+        c.opt.format = jh.format; c.opt.level = jh.level; c.opt.eat = jh.eat; c.opt.inputs = jh.inputs;
+        if (!c.arc.open(c.archive, plat::OpenRWExisting)) { c.fail("Cannot open archive " + c.archive + ": " + plat::lastError()); return finish(); }
+        uint64_t sz = 0; c.arc.size(sz);
+        if (sz < c.st.dataEnd) { c.fail("The archive is shorter than its journal says. It may have been modified; not continuing.", false); return finish(); }
+        if (!c.j.start(c.archive, jbytes)) { c.fail("Cannot open the journal: " + plat::lastError()); return finish(); }
+    } else {
+        if (c.opt.finalizeOnly) { c.fail("No unfinished job found for this archive.", false); return finish(); }
+        Preflight pf = preflight(c.opt);
+        if (!pf.ok) { c.fail(pf.error, false); return finish(); }
+        if (!openArchiveNew(c)) return finish();
+        Buf h; h.u8(R_HEADER); h.u32(JMAGIC); h.u8((uint8_t)c.opt.format); h.u8((uint8_t)c.opt.level); h.u8(c.opt.eat ? 1 : 0); h.str(c.archive);
+        h.u32((uint32_t)c.opt.inputs.size());
+        for (auto& in : c.opt.inputs) h.str(plat::absPath(in));
+        if (!c.j.start(c.archive, std::vector<uint8_t>()) || !c.j.append(h)) { c.fail("Cannot create the journal: " + plat::lastError(), false); c.arc.close(); plat::removeFile(c.archive); c.j.destroy(); return finish(); }
+        for (auto& in : c.opt.inputs) in = plat::absPath(in);
+    }
+    for (auto& e : c.st.entries) c.idxEst += e.rel.size() * 2 + 64;
+
+    if (c.opt.finalizeOnly) {
+        if (c.st.part.active) { c.fail("A large file is half-processed (" + c.st.part.e.rel + "). The job has to be resumed; it cannot be closed here.", true); return finish(); }
+        if (!writeIndex(c, false)) return finish();
+        c.j.destroy(); c.arc.close();
+        c.pr.filesDone = c.st.entries.size(); c.res.ok = true; c.res.partial = true;
+        return finish();
+    }
+
+    Plan plan; std::string err;
+    if (!scan(c.opt.inputs, c.archive, plan, err, resume)) { c.fail(err); return finish(); }
+    for (auto& s : plan.skipped) c.warn(s);
+
+    c.holes = true;
+    for (auto& in : c.opt.inputs) { plat::Stat s; if (plat::stat(in, s) && !plat::supportsHoles(in)) c.holes = false; }
+    uint64_t fr = ~0ull; plat::freeSpace(c.arcDir, fr);
+    c.cfg = makeCfg(c.opt, fr);
+
+    // Work out what is already inside the archive.
+    std::set<std::string> done;
+    for (auto& e : c.st.entries) { done.insert(e.src); c.pr.doneBytes += e.size; }
+    c.pr.filesDone = c.st.entries.size();
+    c.pr.totalBytes = c.pr.doneBytes; c.pr.filesTotal = c.st.entries.size();
+    std::vector<PlanFile> todo; const PlanFile* partFile = nullptr;
+    for (auto& f : plan.files) {
+        if (done.count(f.src)) continue;
+        if (c.st.part.active && f.src == c.st.part.e.src) { partFile = &f; c.pr.totalBytes += f.size; c.pr.doneBytes += c.st.part.offset; c.pr.filesTotal++; continue; }
+        if (f.size == 0) { bool dup = false; for (auto& x : c.st.empties) if (x.rel == f.rel) dup = true;
+            if (!dup) { Entry e; e.src = f.src; e.rel = f.rel; e.mtime = f.mtime; e.attr = f.attr; c.st.empties.push_back(e); } continue; }
+        c.pr.totalBytes += f.size; c.pr.filesTotal++;
+        todo.push_back(f);
+    }
+    // Sources that were verified and journaled, but the crash came before they were deleted.
+    if (resume && c.opt.eat) for (auto& e : c.st.entries) deleteSource(c, e);
+    tick(c, true);
+
+    bool okSoFar = true;
+    if (c.st.part.active) {
+        if (!partFile) { c.fail("The half-processed file is missing: " + c.st.part.e.src, false); return finish(); }
+        okSoFar = processLarge(c, *partFile, true);
+    }
+    size_t i = 0;
+    while (okSoFar && i < todo.size()) {
+        pollStop(c);
+        if (c.stop) break;
+        if (todo[i].size > c.cfg.step) { okSoFar = processLarge(c, todo[i], false); i++; continue; }
+        std::vector<PlanFile> batch; uint64_t sum = 0;
+        while (i < todo.size() && todo[i].size <= c.cfg.step && (batch.empty() || sum + todo[i].size <= c.cfg.step)) { sum += todo[i].size; batch.push_back(todo[i]); i++; }
+        okSoFar = processBatch(c, batch);
+    }
+    if (!okSoFar) {
+        if (c.res.error.empty()) { c.res.paused = true; c.res.resumable = true; }
+        restoreIndex(c);
+        return finish();
+    }
+    if (c.stop == 1) { c.res.paused = true; c.res.resumable = true; return finish(); }
+    if (c.stop == 2 && i < todo.size()) {
+        if (!writeIndex(c, false)) return finish();
+        c.j.destroy(); c.arc.close();
+        c.res.ok = true; c.res.partial = true;
+        return finish();
+    }
+
+    // Finalize: record folders and empty files, write the final index, then clean up.
+    {
+        std::set<std::string> have;
+        for (auto& e : c.st.empties) have.insert(e.rel);
+        for (auto& d : plan.dirs) {
+            if (have.count(d.rel)) continue;
+            Entry e; e.src = d.src; e.rel = d.rel; e.mtime = d.mtime; e.attr = d.attr | 0x10; e.isDir = 1;
+            c.st.empties.push_back(e); have.insert(d.rel);
+        }
+    }
+    Buf rec; rec.u8(R_EMPTY); rec.u32((uint32_t)c.st.empties.size());
+    for (auto& e : c.st.empties) putEntry(rec, e);
+    // De-duplicate on replay is by rel, so journaling the full list again after a crash is harmless.
+    {
+        std::vector<Entry> uniq; std::set<std::string> seen;
+        for (auto& e : c.st.empties) if (seen.insert(e.rel).second) uniq.push_back(e);
+        c.st.empties.swap(uniq);
+    }
+    if (!c.j.append(rec)) { c.fail("Could not write the journal: " + plat::lastError()); return finish(); }
+    CP("final-journaled");
+    if (!writeIndex(c, true)) return finish();
+    CP("final-indexed");
+    if (c.opt.eat) {
+        for (auto& e : c.st.empties) if (!e.isDir) {
+            plat::Stat s;
+            if (plat::stat(e.src, s) && s.size == 0 && !plat::removeFile(e.src)) c.warn("Could not delete empty file: " + e.src);
+        }
+        CP("final-empties-deleted");
+        for (size_t k = c.st.empties.size(); k-- > 0;) if (c.st.empties[k].isDir) plat::removeDir(c.st.empties[k].src);
+        size_t left = 0;
+        for (auto& e : c.st.empties) if (e.isDir) { plat::Stat s; if (plat::stat(e.src, s)) left++; }
+        if (left) c.warn(std::to_string(left) + " folder(s) were not removed because they still contain files that were skipped.");
+    }
+    CP("final-cleaned");
+    c.arc.close();
+    c.j.destroy();
+    c.res.ok = true;
+    return finish();
+}
+
+} // namespace nz
