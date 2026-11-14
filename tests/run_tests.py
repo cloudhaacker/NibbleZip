@@ -69,6 +69,8 @@ def verify(archive, fmt, orig, expect_subset=None):
         # mtime preserved
         assert abs(os.path.getmtime(out + "/game/readme.txt") - 1_600_000_000) < 2
     shutil.rmtree(out)
+    rc, err = run(["verify", archive, "--quiet"])
+    assert rc == 0, "built-in verify failed: " + err
     return got
 
 def fresh(name):
@@ -186,6 +188,21 @@ def main():
         else:
             assert "half-processed" in err, err
             print(fmt, "finalize-only correctly refused mid-file")
+    # 7b. the built-in checker must catch damage, and must accept archives made by real 7-Zip
+    for fmt in ("7z", "zip"):
+        d = fresh("corrupt_" + fmt)
+        rc, err = run(pack_args(d, fmt, step, ["--keep"])); assert rc == 0, err
+        arc = d + "/out." + fmt; size = os.path.getsize(arc); caught = 0
+        for frac in (0.1, 0.35, 0.6, 0.8):
+            data = bytearray(open(arc, "rb").read()); pos = int(size * frac); data[pos] ^= 0x5A
+            open(arc + ".bad." + fmt, "wb").write(data)
+            rc, err = run(["verify", arc + ".bad." + fmt, "--quiet"])
+            caught += rc != 0
+        assert caught == 4, "checker missed corruption (%d/4)" % caught
+        ref = d + "/ref." + fmt
+        r = subprocess.run([SEVENZ, "a", "-mx1", ref, d + "/src/game"], capture_output=True, text=True); assert r.returncode == 0
+        rc, err = run(["verify", ref, "--quiet"]); assert rc == 0, "checker rejected a 7-Zip-made archive: " + err
+        print(fmt, "checker catches corruption and accepts 7-Zip-made archives OK", flush=True)
     # 8. refusal cases
     d = fresh("refuse")
     open(d + "/out.7z", "wb").write(b"x")

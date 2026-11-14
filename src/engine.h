@@ -57,7 +57,15 @@ struct JobInfo {
     uint64_t filesDone = 0, packedBytes = 0;
 };
 
+struct VerifyResult {
+    bool ok = false, cancelled = false;
+    std::string error;
+    uint64_t files = 0, bytes = 0;
+};
+
 Preflight preflight(const Options& opt);
+// Reads a finished 7z or ZIP archive from disk, decompresses every file and checks it against its stored checksum.
+VerifyResult verifyArchive(const std::string& archive, Callbacks& cb);
 Result run(const Options& opt, Callbacks& cb);
 bool loadJob(const std::string& archive, JobInfo& info);
 std::vector<JobInfo> pendingJobs();

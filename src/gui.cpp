@@ -12,6 +12,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <uxtheme.h>
 
 #include <atomic>
 #include <mutex>
@@ -30,7 +31,7 @@ static const wchar_t* kMenuText = L"Compress and reclaim space (NibbleZip)";
 #define NZ_COPYDATA_ADD 0x4E5A0001
 
 enum { ID_LIST = 100, ID_ADDFILES, ID_ADDFOLDER, ID_REMOVE, ID_CLEAR, ID_ARCHIVE, ID_BROWSE, ID_FORMAT, ID_LEVEL, ID_EAT,
-       ID_START, ID_PAUSE, ID_STOP, ID_MENU };
+       ID_START, ID_PAUSE, ID_STOP, ID_MENU, ID_VERIFY, ID_THEME, ID_EATLABEL };
 
 static std::wstring W(const std::string& s) {
     if (s.empty()) return std::wstring();
@@ -51,11 +52,13 @@ struct App {
     HINSTANCE inst = nullptr;
     HWND wnd = nullptr, list = nullptr, archive = nullptr, format = nullptr, level = nullptr, eat = nullptr, info = nullptr,
          bar = nullptr, st1 = nullptr, st2 = nullptr, start = nullptr, pause = nullptr, stop = nullptr, menuBtn = nullptr,
-         addFiles = nullptr, addFolder = nullptr, removeBtn = nullptr, clearBtn = nullptr, browse = nullptr;
+         addFiles = nullptr, addFolder = nullptr, removeBtn = nullptr, clearBtn = nullptr, browse = nullptr,
+         eatLabel = nullptr, verifyBtn = nullptr, themeBtn = nullptr;
     HFONT font = nullptr, fontBig = nullptr;
     int dpi = 96;
     std::vector<std::string> items;
-    bool autoName = true, settingText = false, running = false, closing = false;
+    bool autoName = true, settingText = false, running = false, closing = false, verifying = false;
+    nz::VerifyResult vres;
     std::thread worker;
     std::mutex mu;
     nz::Progress prog;
@@ -92,6 +95,92 @@ struct GuiCb : nz::Callbacks {
         return g.stopReq.load();
     }
 };
+
+// ---------------------------------------------------------------- settings and theme
+static DWORD regGet(const wchar_t* name, DWORD def) {
+    HKEY k; DWORD v = def, sz = sizeof(v), type = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\NibbleZip", 0, KEY_READ, &k) != ERROR_SUCCESS) return def;
+    if (RegQueryValueExW(k, name, nullptr, &type, (BYTE*)&v, &sz) != ERROR_SUCCESS || type != REG_DWORD) v = def;
+    RegCloseKey(k);
+    return v;
+}
+static void regSet(const wchar_t* name, DWORD v) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\NibbleZip", 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    RegCloseKey(k);
+}
+struct ThemeT {
+    int pref = 0;            // 0 follow Windows, 1 light, 2 dark
+    bool dark = false;
+    COLORREF bg = 0, text = 0, ctl = 0, line = 0, hdr = 0;
+    HBRUSH brBg = nullptr, brCtl = nullptr, brHdr = nullptr;
+    FARPROC allowWnd = nullptr;
+};
+static ThemeT T;
+static bool systemDark() {
+    HKEY k; DWORD v = 1, sz = sizeof(v);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+    if (RegQueryValueExW(k, L"AppsUseLightTheme", nullptr, nullptr, (BYTE*)&v, &sz) != ERROR_SUCCESS) v = 1;
+    RegCloseKey(k);
+    return v == 0;
+}
+static DWORD winBuild() {
+    typedef void(WINAPI * Fn)(DWORD*, DWORD*, DWORD*);
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    Fn f = nt ? (Fn)(void*)GetProcAddress(nt, "RtlGetNtVersionNumbers") : nullptr;
+    DWORD a = 0, b = 0, c = 0;
+    if (f) f(&a, &b, &c);
+    return a >= 10 ? (c & 0x0FFFFFFF) : 0;
+}
+static void initTheme() {
+    T.pref = (int)regGet(L"Theme", 0);
+    T.dark = T.pref == 2 || (T.pref == 0 && systemDark());
+    if (T.dark) { T.bg = RGB(32, 32, 32); T.text = RGB(240, 240, 240); T.ctl = RGB(45, 45, 45); T.line = RGB(80, 80, 80); T.hdr = RGB(56, 56, 56); }
+    else { T.bg = GetSysColor(COLOR_WINDOW); T.text = GetSysColor(COLOR_WINDOWTEXT); T.ctl = T.bg; T.line = RGB(200, 200, 200); T.hdr = T.bg; }
+    T.brBg = CreateSolidBrush(T.bg); T.brCtl = CreateSolidBrush(T.ctl); T.brHdr = CreateSolidBrush(T.hdr);
+    DWORD build = winBuild();
+    if (T.dark && build >= 17763) {
+        // Windows' own dark styles for buttons, scroll bars and drop-downs (Windows 10 1809 and later).
+        HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+        if (ux) {
+            FARPROC p135 = GetProcAddress(ux, MAKEINTRESOURCEA(135));
+            if (p135) { if (build >= 18362) ((int(WINAPI*)(int))(void*)p135)(2); else ((BOOL(WINAPI*)(BOOL))(void*)p135)(TRUE); }
+            FARPROC p104 = GetProcAddress(ux, MAKEINTRESOURCEA(104));
+            if (p104) ((void(WINAPI*)())(void*)p104)();
+            T.allowWnd = GetProcAddress(ux, MAKEINTRESOURCEA(133));
+        }
+    }
+}
+static void darken(HWND h, const wchar_t* theme) {
+    if (!T.dark || !h) return;
+    if (T.allowWnd) ((BOOL(WINAPI*)(HWND, BOOL))(void*)T.allowWnd)(h, TRUE);
+    SetWindowTheme(h, theme, nullptr);
+}
+static void darkTitleBar(HWND h) {
+    if (!T.dark) return;
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (!dwm) return;
+    typedef HRESULT(WINAPI * Fn)(HWND, DWORD, LPCVOID, DWORD);
+    Fn f = (Fn)(void*)GetProcAddress(dwm, "DwmSetWindowAttribute");
+    BOOL on = TRUE;
+    if (f && FAILED(f(h, 20, &on, sizeof(on)))) f(h, 19, &on, sizeof(on));
+}
+static const wchar_t* themeLabel() { return T.pref == 1 ? L"Theme: Light" : T.pref == 2 ? L"Theme: Dark" : L"Theme: Auto"; }
+
+static bool acceptDisclaimer() {
+    if (regGet(L"DisclaimerAccepted", 0) == 1) return true;
+    int r = MessageBoxW(nullptr,
+        L"NibbleZip permanently deletes your original files as it compresses them. That is its purpose, and it cannot be undone.\n\n"
+        L"This software is provided \"as is\", without warranty of any kind. The authors and contributors are not responsible or liable "
+        L"for any loss of data or any other damage arising from its use. You use it entirely at your own risk.\n\n"
+        L"Keep a backup of anything you cannot afford to lose.\n\n"
+        L"Press OK to accept these terms and continue, or Cancel to exit.",
+        L"NibbleZip – please read", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND);
+    if (r != IDOK) return false;
+    regSet(L"DisclaimerAccepted", 1);
+    return true;
+}
 
 // ---------------------------------------------------------------- right-click menu
 static std::wstring exePath() {
@@ -246,7 +335,7 @@ static void formatChanged() {
 // ---------------------------------------------------------------- running a job
 static void setRunningUI(bool on) {
     g.running = on;
-    HWND inputs[] = {g.list, g.archive, g.format, g.level, g.eat, g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn};
+    HWND inputs[] = {g.list, g.archive, g.format, g.level, g.eat, g.eatLabel, g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.verifyBtn, g.themeBtn};
     for (HWND h : inputs) EnableWindow(h, !on);
     ShowWindow(g.start, on ? SW_HIDE : SW_SHOW);
     ShowWindow(g.pause, on ? SW_SHOW : SW_HIDE);
@@ -258,7 +347,43 @@ static void setRunningUI(bool on) {
     EnableWindow(g.pause, TRUE); EnableWindow(g.stop, TRUE);
     SetWindowTextW(g.pause, L"Pause");
     if (on) { SendMessageW(g.bar, PBM_SETPOS, 0, 0); SetWindowTextW(g.st1, L"Preparing…"); SetWindowTextW(g.st2, L""); }
-    else { SetWindowTextW(g.wnd, kTitle); updateInfo(); }
+    else { g.verifying = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); }
+}
+static void startVerify(const std::string& path) {
+    if (g.worker.joinable()) g.worker.join();
+    g.stopReq = 0; g.pauseFlag = false; g.haveStart = false;
+    { std::lock_guard<std::mutex> l(g.mu); g.prog = nz::Progress(); g.vres = nz::VerifyResult(); }
+    setRunningUI(true);
+    g.verifying = true;
+    SetWindowTextW(g.st1, L"Checking…");
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    g.worker = std::thread([path]() {
+        GuiCb cb;
+        nz::VerifyResult v = nz::verifyArchive(path, cb);
+        { std::lock_guard<std::mutex> l(g.mu); g.vres = v; }
+        PostMessageW(g.wnd, WM_NZ_DONE, 0, 0);
+    });
+}
+static void pickVerify() {
+    wchar_t buf[32768]; buf[0] = 0;
+    OPENFILENAMEW ofn; memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = g.wnd;
+    ofn.lpstrFilter = L"Archives (*.7z;*.zip)\0*.7z;*.zip\0All files\0*.*\0";
+    ofn.lpstrFile = buf; ofn.nMaxFile = 32767;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    ofn.lpstrTitle = L"Choose an archive to check";
+    if (GetOpenFileNameW(&ofn)) startVerify(U(buf));
+}
+static void relaunch() {
+    std::wstring cmd = L"\"" + exePath() + L"\" --new";
+    for (auto& it : g.items) cmd += L" \"" + W(it) + L"\"";
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
+    STARTUPINFOW si; memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        DestroyWindow(g.wnd);
+    }
 }
 static void startJob(const nz::Options& opt) {
     if (g.worker.joinable()) g.worker.join();
@@ -288,10 +413,12 @@ static void onProgress() {
     SendMessageW(g.bar, PBM_SETPOS, (WPARAM)(frac * 1000), 0);
     ULONGLONG now = GetTickCount64();
     if (!g.haveStart && p.totalBytes) { g.haveStart = true; g.startTick = now; g.startDone = p.doneBytes; }
-    std::wstring s1 = g.pauseFlag.load() ? L"Paused" : (p.current.empty() ? L"Preparing…" : L"Compressing: " + W(p.current));
+    std::wstring s1 = g.pauseFlag.load() ? L"Paused" : (p.current.empty() ? (g.verifying ? L"Checking…" : L"Preparing…") : (g.verifying ? L"Checking: " : L"Compressing: ") + W(p.current));
     wchar_t pct[32]; _snwprintf(pct, 31, L"%.1f%%", frac * 100); pct[31] = 0;
-    std::wstring s2 = std::wstring(pct) + L"   •   Archive: " + W(nz::humanSize(p.packedBytes)) + L"   •   Space reclaimed: " + W(nz::humanSize(p.reclaimedBytes)) +
-                      L"   •   Files: " + std::to_wstring(p.filesDone) + L" of " + std::to_wstring(p.filesTotal);
+    std::wstring s2 = std::wstring(pct);
+    if (g.verifying) s2 += L"   •   Read " + W(nz::humanSize(p.doneBytes)) + L" of " + W(nz::humanSize(p.totalBytes));
+    else s2 += L"   •   Archive: " + W(nz::humanSize(p.packedBytes)) + L"   •   Space reclaimed: " + W(nz::humanSize(p.reclaimedBytes)) +
+               L"   •   Files: " + std::to_wstring(p.filesDone) + L" of " + std::to_wstring(p.filesTotal);
     double el = (double)(now - g.startTick) / 1000.0;
     if (g.haveStart && el > 8 && p.doneBytes > g.startDone && p.totalBytes > p.doneBytes && !g.pauseFlag.load()) {
         double rate = (double)(p.doneBytes - g.startDone) / el;
@@ -304,10 +431,17 @@ static void onProgress() {
 static void onDone() {
     if (g.worker.joinable()) g.worker.join();
     SetThreadExecutionState(ES_CONTINUOUS);
-    nz::Result r;
-    { std::lock_guard<std::mutex> l(g.mu); r = g.result; }
+    nz::Result r; nz::VerifyResult v; bool wasVerify = g.verifying;
+    { std::lock_guard<std::mutex> l(g.mu); r = g.result; v = g.vres; }
     setRunningUI(false);
     if (g.closing) { DestroyWindow(g.wnd); return; }
+    if (wasVerify) {
+        if (v.ok) msg(L"The archive is intact.\n\n" + std::to_wstring(v.files) + L" file(s), " + W(nz::humanSize(v.bytes)) +
+                      L", were read back from disk, decompressed and matched their checksums.", MB_OK | MB_ICONINFORMATION);
+        else if (v.cancelled) msg(L"Check cancelled.", MB_OK | MB_ICONINFORMATION);
+        else msg(L"A problem was found:\n\n" + W(v.error), MB_OK | MB_ICONERROR);
+        return;
+    }
     std::wstring t; UINT icon = MB_ICONINFORMATION;
     std::wstring stats = std::to_wstring(r.final.filesDone) + L" file(s) stored.  Archive size: " + W(nz::humanSize(r.final.packedBytes)) +
                          L".  Space reclaimed: " + W(nz::humanSize(r.final.reclaimedBytes)) + L".";
@@ -364,6 +498,7 @@ static void onStart() {
     startJob(opt);
 }
 static void onStop() {
+    if (g.verifying) { g.stopReq = 1; g.pauseFlag = false; EnableWindow(g.stop, FALSE); return; }
     int r = msg(L"Stop compressing?\n\n"
                 L"Yes = stop now. Everything stored so far is safe and the job can be resumed later.\n\n"
                 L"No = finish the file in progress, then close the archive. Files not reached stay where they are.\n\n"
@@ -383,12 +518,40 @@ static HWND mk(const wchar_t* cls, const wchar_t* text, DWORD style, DWORD ex, i
     SendMessageW(c, WM_SETFONT, (WPARAM)g.font, TRUE);
     return c;
 }
+// Dark mode: the list header is drawn by hand so it never ends up light.
+static LRESULT CALLBACK listSub(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (m == WM_NOTIFY && T.dark) {
+        NMHDR* n = (NMHDR*)lp;
+        HWND hdr = (HWND)SendMessageW(h, LVM_GETHEADER, 0, 0);
+        if (n->code == NM_CUSTOMDRAW && n->hwndFrom == hdr) {
+            NMCUSTOMDRAW* cd = (NMCUSTOMDRAW*)lp;
+            if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+                RECT r = cd->rc;
+                FillRect(cd->hdc, &r, T.brHdr);
+                RECT sep = r; sep.left = sep.right - 1;
+                HBRUSH lb = CreateSolidBrush(T.line); FillRect(cd->hdc, &sep, lb); DeleteObject(lb);
+                wchar_t txt[64]; txt[0] = 0;
+                HDITEMW hi; memset(&hi, 0, sizeof(hi)); hi.mask = HDI_TEXT; hi.pszText = txt; hi.cchTextMax = 63;
+                SendMessageW(hdr, HDM_GETITEMW, (WPARAM)cd->dwItemSpec, (LPARAM)&hi);
+                SetTextColor(cd->hdc, T.text); SetBkMode(cd->hdc, TRANSPARENT);
+                r.left += S(6); r.right -= S(4);
+                DrawTextW(cd->hdc, txt, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                return CDRF_SKIPDEFAULT;
+            }
+        }
+    }
+    return DefSubclassProc(h, m, wp, lp);
+}
+
 static void createControls() {
     g.font = CreateFontW(-MulDiv(9, g.dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g.fontBig = CreateFontW(-MulDiv(15, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     const int M = 20, CW = 640 - 2 * M;
-    HWND title = mk(L"STATIC", L"NibbleZip", 0, 0, M, 14, 300, 30, -1);
+    HWND title = mk(L"STATIC", L"NibbleZip", 0, 0, M, 14, 280, 30, -1);
     SendMessageW(title, WM_SETFONT, (WPARAM)g.fontBig, TRUE);
+    g.verifyBtn = mk(L"BUTTON", L"Check an archive…", WS_TABSTOP, 0, M + CW - 100 - 8 - 150, 14, 150, 26, ID_VERIFY);
+    g.themeBtn = mk(L"BUTTON", themeLabel(), WS_TABSTOP, 0, M + CW - 100, 14, 100, 26, ID_THEME);
     mk(L"STATIC", L"Compresses files and frees up their space as it goes, so you don't need room for both.", 0, 0, M, 46, CW, 18, -1);
 
     g.list = mk(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | WS_TABSTOP, WS_EX_CLIENTEDGE, M, 74, CW, 170, ID_LIST);
@@ -398,6 +561,15 @@ static void createControls() {
         LVCOLUMNW c; memset(&c, 0, sizeof(c));
         c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM; c.pszText = (LPWSTR)cols[i]; c.cx = S(widths[i]); c.iSubItem = i;
         SendMessageW(g.list, LVM_INSERTCOLUMNW, i, (LPARAM)&c);
+    }
+    SendMessageW(g.list, LVM_SETCOLUMNWIDTH, 2, LVSCW_AUTOSIZE_USEHEADER);
+    if (T.dark) {
+        SendMessageW(g.list, LVM_SETBKCOLOR, 0, (LPARAM)T.ctl);
+        SendMessageW(g.list, LVM_SETTEXTBKCOLOR, 0, (LPARAM)T.ctl);
+        SendMessageW(g.list, LVM_SETTEXTCOLOR, 0, (LPARAM)T.text);
+        SetWindowSubclass(g.list, listSub, 1, 0);
+        darken(g.list, L"DarkMode_Explorer");
+        darken((HWND)SendMessageW(g.list, LVM_GETHEADER, 0, 0), L"ItemsView");
     }
     g.addFiles = mk(L"BUTTON", L"Add files…", WS_TABSTOP, 0, M, 252, 100, 28, ID_ADDFILES);
     g.addFolder = mk(L"BUTTON", L"Add folder…", WS_TABSTOP, 0, M + 108, 252, 100, 28, ID_ADDFOLDER);
@@ -419,7 +591,9 @@ static void createControls() {
     for (auto s : lv) SendMessageW(g.level, CB_ADDSTRING, 0, (LPARAM)s);
     SendMessageW(g.level, CB_SETCURSEL, 1, 0);
 
-    g.eat = mk(L"BUTTON", L"Delete each original once it is safely stored and verified (frees space while compressing)", BS_AUTOCHECKBOX | WS_TABSTOP, 0, M, 396, CW, 22, ID_EAT);
+    // The tick box and its text are separate controls so the text colour follows the theme.
+    g.eat = mk(L"BUTTON", L"", BS_AUTOCHECKBOX | WS_TABSTOP, 0, M, 397, 18, 18, ID_EAT);
+    g.eatLabel = mk(L"STATIC", L"Delete each original once it is safely stored and verified (frees space while compressing)", SS_NOTIFY | SS_NOPREFIX, 0, M + 22, 398, CW - 22, 20, ID_EATLABEL);
     SendMessageW(g.eat, BM_SETCHECK, BST_CHECKED, 0);
 
     g.info = mk(L"STATIC", L"", SS_NOPREFIX, 0, M, 432, CW, 54, -1);
@@ -432,6 +606,14 @@ static void createControls() {
     g.start = mk(L"BUTTON", L"Start", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, M + CW - 130, 520, 130, 30, ID_START);
     g.pause = mk(L"BUTTON", L"Pause", WS_TABSTOP, 0, M + CW - 268, 520, 130, 30, ID_PAUSE);
     g.stop = mk(L"BUTTON", L"Stop…", WS_TABSTOP, 0, M + CW - 130, 520, 130, 30, ID_STOP);
+    if (T.dark) {
+        HWND btns[] = {g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.start, g.pause, g.stop, g.verifyBtn, g.themeBtn, g.eat};
+        for (HWND b : btns) darken(b, L"DarkMode_Explorer");
+        darken(g.format, L"DarkMode_CFD"); darken(g.level, L"DarkMode_CFD"); darken(g.archive, L"DarkMode_CFD");
+        SetWindowTheme(g.bar, L"", L"");
+        SendMessageW(g.bar, PBM_SETBKCOLOR, 0, (LPARAM)RGB(60, 60, 60));
+        SendMessageW(g.bar, PBM_SETBARCOLOR, 0, (LPARAM)RGB(70, 160, 210));
+    }
     refreshMenuButton();
     setRunningUI(false);
 }
@@ -442,6 +624,10 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         int id = LOWORD(wp), code = HIWORD(wp);
         if (id == ID_ARCHIVE && code == EN_CHANGE) { if (!g.settingText) { g.autoName = false; updateInfo(); } return 0; }
         if (id == ID_FORMAT && code == CBN_SELCHANGE) { formatChanged(); return 0; }
+        if (id == ID_EATLABEL && code == STN_CLICKED) {
+            if (!g.running) SendMessageW(g.eat, BM_SETCHECK, SendMessageW(g.eat, BM_GETCHECK, 0, 0) == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED, 0);
+            return 0;
+        }
         if (code != BN_CLICKED) break;
         switch (id) {
         case ID_ADDFILES: pickItems(false); return 0;
@@ -450,6 +636,11 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         case ID_CLEAR: clearItems(); return 0;
         case ID_BROWSE: browseArchive(); return 0;
         case ID_START: onStart(); return 0;
+        case ID_VERIFY: pickVerify(); return 0;
+        case ID_THEME:
+            T.pref = (T.pref + 1) % 3; regSet(L"Theme", (DWORD)T.pref);
+            relaunch();   // the theme is applied when the window is built
+            return 0;
         case ID_STOP: onStop(); return 0;
         case ID_PAUSE: {
             bool p = !g.pauseFlag.load(); g.pauseFlag = p;
@@ -497,14 +688,20 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return TRUE;
     }
     case WM_CTLCOLORSTATIC:
-        SetBkColor((HDC)wp, GetSysColor(COLOR_WINDOW));
-        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    case WM_CTLCOLORBTN:
+        SetTextColor((HDC)wp, T.text); SetBkColor((HDC)wp, T.bg);
+        return (LRESULT)T.brBg;
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        SetTextColor((HDC)wp, T.text); SetBkColor((HDC)wp, T.ctl);
+        return (LRESULT)T.brCtl;
     case WM_NZ_PROGRESS: onProgress(); return 0;
     case WM_NZ_DONE: onDone(); return 0;
     case WM_TIMER: if (wp == 1) { KillTimer(h, 1); if (!g.running && IsWindowEnabled(h)) onStartup(); } return 0;
     case WM_CLOSE:
         if (g.running) {
             if (g.closing) return 0;
+            if (g.verifying) { g.closing = true; g.stopReq = 1; g.pauseFlag = false; return 0; }
             if (msg(L"A job is running.\n\nStop it safely and exit? Everything stored so far is kept and the job can be resumed next time.", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return 0;
             if (!g.running) { DestroyWindow(h); return 0; }
             g.closing = true; g.stopReq = 1; g.pauseFlag = false;
@@ -536,12 +733,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g.inst = inst;
     int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::vector<std::wstring> paths;
-    for (int i = 1; argv && i < argc; i++) paths.push_back(argv[i]);
+    bool forceNew = false; std::wstring checkPath;
+    for (int i = 1; argv && i < argc; i++) {
+        if (!wcscmp(argv[i], L"--new")) forceNew = true;
+        else if (!wcscmp(argv[i], L"--check") && i + 1 < argc) { checkPath = argv[++i]; forceNew = true; }
+        else paths.push_back(argv[i]);
+    }
 
     // When Explorer launches one copy per selected item, later copies hand their item to the first window.
     HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\NibbleZipInstance");
     bool first = GetLastError() != ERROR_ALREADY_EXISTS;
-    if (!first && !paths.empty()) {
+    if (!first && !paths.empty() && !forceNew) {
         for (int attempt = 0; attempt < 40; attempt++) {
             bool all = true;
             for (auto it = paths.begin(); it != paths.end();) {
@@ -555,6 +757,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         }
     }
 
+    if (!acceptDisclaimer()) return 0;
+    initTheme();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     INITCOMMONCONTROLSEX icc; icc.dwSize = sizeof(icc); icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
@@ -563,7 +767,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     WNDCLASSEXW wc; memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc); wc.lpfnWndProc = wndProc; wc.hInstance = inst; wc.lpszClassName = kClass;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = T.brBg;
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1)); wc.hIconSm = wc.hIcon;
     if (!wc.hIcon) { wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION); wc.hIconSm = wc.hIcon; }
     RegisterClassExW(&wc);
@@ -573,11 +777,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     AdjustWindowRectEx(&r, style, FALSE, WS_EX_ACCEPTFILES);
     g.wnd = CreateWindowExW(WS_EX_ACCEPTFILES, kClass, kTitle, style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     if (!g.wnd) return 1;
+    darkTitleBar(g.wnd);
     createControls();
     for (auto& p : paths) addItem(U(p));
     ShowWindow(g.wnd, show);
     UpdateWindow(g.wnd);
     if (menuInstalled()) setMenu(true);   // keep the menu pointing at this exe if it was moved
+    if (!checkPath.empty()) startVerify(U(checkPath));
     SetTimer(g.wnd, 1, 1500, nullptr);   // look for unfinished jobs once sibling launches have handed over their items
 
     MSG m;

@@ -3,6 +3,14 @@
 Compresses files into a 7z or ZIP archive and frees up the originals' disk space *as it goes*,
 so you never need room for both the files and the archive at once.
 
+## IMPORTANT: no warranty, use at your own risk
+
+NibbleZip **permanently deletes your original files** as it compresses them. That is its purpose
+and it cannot be undone. The software is provided "as is", without warranty of any kind. The
+authors and contributors are **not responsible or liable for any loss of data** or any other
+damage arising from its use. Keep a backup of anything you cannot afford to lose. See
+`LICENSE.txt` for the full terms. The app asks you to accept this the first time it runs.
+
 ## Using it
 
 1. Run `NibbleZip.exe` (no install). Windows may show a blue "Windows protected your PC" box
@@ -11,6 +19,13 @@ so you never need room for both the files and the archive at once.
 3. Pick 7z (smallest) or ZIP (opens everywhere) and a compression level, then press **Start**.
 4. Optional: **Add to right-click menu** puts "Compress and reclaim space (NibbleZip)" on the
    right-click menu of files and folders (under "Show more options" on Windows 11).
+
+**Check an archive** re-reads a finished 7z or ZIP from disk, decompresses every file and compares
+it with its stored checksum. **Theme** switches between following Windows, light and dark.
+
+Data that is already compressed (video, music, zips, most game archives) is detected by sampling
+and stored as it is instead of being recompressed, which is many times faster for almost no size
+difference.
 
 Untick "Delete each original..." to use it as an ordinary archiver. That is the best way to try
 it for the first time.

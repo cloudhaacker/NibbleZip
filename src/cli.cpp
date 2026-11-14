@@ -27,6 +27,7 @@ static int usage() {
         "  nibblezip-cli pack [-f 7z|zip] [-l 0..3] [--keep] -o ARCHIVE INPUT...\n"
         "  nibblezip-cli check [-f 7z|zip] [-l 0..3] [--keep] -o ARCHIVE INPUT...\n"
         "  nibblezip-cli resume ARCHIVE [--finalize]\n"
+        "  nibblezip-cli verify ARCHIVE\n"
         "  nibblezip-cli pending\n");
     return 2;
 }
@@ -68,10 +69,17 @@ int main(int argc, char** argv) {
         else if (a == "--step" && i + 1 < argc) o.testStep = strtoull(argv[++i], nullptr, 10);
         else if (a == "--pause-after" && i + 1 < argc) cb.pauseAfter = strtoull(argv[++i], nullptr, 10);
         else if (a == "--finish-after" && i + 1 < argc) cb.finishAfter = strtoull(argv[++i], nullptr, 10);
-        else if (cmd == "resume" && o.archive.empty()) o.archive = a;
+        else if ((cmd == "resume" || cmd == "verify") && o.archive.empty()) o.archive = a;
         else o.inputs.push_back(a);
     }
     if (o.archive.empty()) return usage();
+    if (cmd == "verify") {
+        nz::VerifyResult v = nz::verifyArchive(o.archive, cb);
+        if (!cb.quiet) fprintf(stderr, "\n");
+        if (v.ok) { fprintf(stderr, "Archive is OK: %llu files, %s checked.\n", (unsigned long long)v.files, nz::humanSize(v.bytes).c_str()); return 0; }
+        fprintf(stderr, "%s\n", v.cancelled ? "Cancelled." : ("PROBLEM: " + v.error).c_str());
+        return 1;
+    }
     if (cmd == "check" || cmd == "pack") {
         nz::JobInfo ji;
         if (cmd == "check" || !nz::loadJob(o.archive, ji)) {

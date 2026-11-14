@@ -381,6 +381,44 @@ static bool lzmaVerify(const uint8_t* packed, size_t pn, uint8_t prop, const uin
     return ok;
 }
 
+// Smallest LZMA2 dictionary property byte that covers `dict` bytes.
+static uint8_t lzma2PropFor(uint64_t dict) {
+    for (unsigned p = 0; p < 40; p++) if ((((uint64_t)2 | (p & 1)) << (p / 2 + 11)) >= dict) return (uint8_t)p;
+    return 40;
+}
+// Quick test on evenly spaced samples: how well does this data compress? (1.0 = not at all)
+static double sampleRatio(const uint8_t* data, size_t n) {
+    const size_t piece = 32768;
+    if (n < 2 * piece) return 0.0;
+    size_t k = std::min<size_t>(24, n / piece), in = 0, out = 0;
+    std::vector<uint8_t> tmp(piece + 1024);
+    for (size_t i = 0; i < k; i++) {
+        size_t at = (size_t)((uint64_t)(n - piece) * i / (k > 1 ? k - 1 : 1));
+        z_stream z; memset(&z, 0, sizeof(z));
+        if (deflateInit2(&z, 1, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) return 0.0;
+        z.next_in = (Bytef*)(data + at); z.avail_in = (uInt)piece; z.next_out = tmp.data(); z.avail_out = (uInt)tmp.size();
+        deflate(&z, Z_FINISH);
+        in += piece; out += tmp.size() - z.avail_out;
+        deflateEnd(&z);
+    }
+    return in ? (double)out / (double)in : 0.0;
+}
+const double kStoreRatio = 0.97;   // above this, compressing is a waste of time: store the data as it is
+// Writes data as uncompressed LZMA2 chunks (a valid LZMA2 stream any 7z reader understands).
+static bool storeLzma2(const uint8_t* in, size_t n, bool final, std::vector<uint8_t>& out) {
+    out.clear();
+    try { out.reserve(n + n / 65536 * 3 + 16); } catch (...) { return false; }
+    size_t pos = 0; bool first = true;
+    while (pos < n) {
+        size_t c = std::min<size_t>(65536, n - pos);
+        out.push_back(first ? 0x01 : 0x02); out.push_back((uint8_t)((c - 1) >> 8)); out.push_back((uint8_t)(c - 1));
+        out.insert(out.end(), in + pos, in + pos + c);
+        pos += c; first = false;
+    }
+    if (final) out.push_back(0);
+    return true;
+}
+
 struct ZJob { const uint8_t* in = nullptr; size_t n = 0; int flush = Z_FINISH; std::vector<uint8_t> out; bool ok = false; };
 static void deflateOne(ZJob& j, int level) {
     z_stream s; memset(&s, 0, sizeof(s));
@@ -650,21 +688,30 @@ static bool processBatch(Ctx& c, const std::vector<PlanFile>& files) {
     size_t n = c.buf.size();
     Folder fo; fo.first = c.st.entries.size(); fo.count = ents.size();
     if (c.opt.format == F7Z) {
-        if (!lzmaEncode(c, c.buf.data(), n, true, true, c.out, fo.prop)) return false;
+        if (sampleRatio(c.buf.data(), n) > kStoreRatio) {
+            fo.prop = lzma2PropFor(std::min<uint64_t>(c.cfg.dict, std::max<uint64_t>(n, 4096)));
+            if (!storeLzma2(c.buf.data(), n, true, c.out)) return c.fail("Out of memory");
+        } else if (!lzmaEncode(c, c.buf.data(), n, true, true, c.out, fo.prop)) return false;
         fo.packSize = c.out.size();
         if (!commitData(c)) return false;
         if (!lzmaVerify(c.out.data(), c.out.size(), fo.prop, c.buf.data(), n, true))
             return c.fail("Verification failed: decompressed data does not match the source files. Nothing was deleted.");
     } else {
         std::vector<ZJob> jobs(ents.size());
-        for (size_t i = 0; i < ents.size(); i++) { jobs[i].in = c.buf.data() + offs[i]; jobs[i].n = (size_t)ents[i].size; jobs[i].flush = Z_FINISH; }
-        runZJobs(jobs, c.cfg.zLevel, c.cfg.totalThreads);
+        std::vector<ZJob> work; std::vector<size_t> workIdx; std::vector<char> forceStore(ents.size(), 0);
+        for (size_t i = 0; i < ents.size(); i++) {
+            jobs[i].in = c.buf.data() + offs[i]; jobs[i].n = (size_t)ents[i].size; jobs[i].flush = Z_FINISH;
+            if (sampleRatio(jobs[i].in, jobs[i].n) > kStoreRatio) { jobs[i].ok = true; forceStore[i] = 1; }
+            else { work.push_back(ZJob()); work.back().in = jobs[i].in; work.back().n = jobs[i].n; workIdx.push_back(i); }
+        }
+        runZJobs(work, c.cfg.zLevel, c.cfg.totalThreads);
+        for (size_t k = 0; k < work.size(); k++) { jobs[workIdx[k]].ok = work[k].ok; jobs[workIdx[k]].out.swap(work[k].out); }
         c.out.clear();
         std::vector<size_t> dataAt(ents.size());
         for (size_t i = 0; i < ents.size(); i++) {
             if (!jobs[i].ok) return c.fail("Compression failed for " + ents[i].rel);
             Entry& e = ents[i];
-            bool store = jobs[i].out.size() >= e.size;
+            bool store = forceStore[i] || jobs[i].out.size() >= e.size;
             e.method = store ? 0 : 8; e.csize = store ? e.size : jobs[i].out.size(); e.lfh = c.st.dataEnd + c.out.size();
             Buf h; zipLFH(h, e);
             c.out.insert(c.out.end(), h.b.begin(), h.b.end());
@@ -714,8 +761,11 @@ static bool processLarge(Ctx& c, const PlanFile& f, bool resuming) {
         p = PartState(); p.active = true;
         p.e.src = f.src; p.e.rel = f.rel; p.e.size = size; p.e.mtime = f.mtime; p.e.attr = f.attr; p.e.z64 = 1; p.e.method = 8;
         p.offset = 0; p.crcState = CRC_INIT_VAL; p.packStart = c.st.dataEnd; p.e.lfh = c.st.dataEnd;
+        p.prop = lzma2PropFor(c.cfg.dict);
     } else if (size != p.e.size) {
         return c.fail("The half-processed file changed size and cannot be continued: " + f.src, false);
+    } else if (c.opt.format == F7Z && p.prop != lzma2PropFor(c.cfg.dict)) {
+        return c.fail("Compression settings changed since this file was started");
     }
     c.pr.current = f.rel;
     try { c.buf.resize((size_t)std::min<uint64_t>(c.cfg.step, size)); } catch (...) { return c.fail("Out of memory"); }
@@ -726,14 +776,36 @@ static bool processLarge(Ctx& c, const PlanFile& f, bool resuming) {
         bool final = p.offset + n == size, first = p.offset == 0;
         if (!in.readAt(p.offset, c.buf.data(), n, got) || got != n) return c.fail("Read error in " + f.src + ": " + plat::lastError());
         c.stepBase = c.pr.doneBytes; c.stepOut = 0;
-        size_t hdrLen = 0; uint8_t prop = 0;
+        size_t hdrLen = 0; uint8_t prop = p.prop;
+        bool stored;
+        if (c.opt.format == F7Z) stored = sampleRatio(c.buf.data(), n) > kStoreRatio;
+        else if (!first) stored = p.e.method == 0;
+        else {
+            // A ZIP entry has one method for the whole file, so sample across the whole file before choosing.
+            const size_t piece = 32768; std::vector<uint8_t> smp(24 * piece); size_t have = 0, g2 = 0;
+            for (int i = 0; i < 24; i++) {
+                uint64_t at = (size - piece) * (uint64_t)i / 23;
+                if (in.readAt(at, smp.data() + have, piece, g2) && g2 == piece) have += piece;
+            }
+            stored = sampleRatio(smp.data(), have) > kStoreRatio;
+        }
         if (c.opt.format == F7Z) {
-            if (!lzmaEncode(c, c.buf.data(), n, final, false, c.out, prop)) return false;
-            if (first) p.prop = prop;
-            else if (prop != p.prop) return c.fail("Compression settings changed since this file was started");
+            if (stored) { if (!storeLzma2(c.buf.data(), n, final, c.out)) return c.fail("Out of memory"); }
+            else {
+                if (!lzmaEncode(c, c.buf.data(), n, final, false, c.out, prop)) return false;
+                if (prop != p.prop) return c.fail("Compression settings changed since this file was started");
+            }
             if (!commitData(c)) return false;
             if (!lzmaVerify(c.out.data(), c.out.size(), prop, c.buf.data(), n, final))
                 return c.fail("Verification failed: decompressed data does not match the source. Nothing was released.");
+        } else if ((first ? (p.e.method = stored ? 0 : 8) : p.e.method) == 0) {
+            // ZIP "stored" entry: the data goes in unchanged.
+            c.out.clear();
+            if (first) { Buf h; zipLFH(h, p.e); c.out = h.b; hdrLen = c.out.size(); }
+            try { c.out.insert(c.out.end(), c.buf.data(), c.buf.data() + n); } catch (...) { return c.fail("Out of memory"); }
+            if (!commitData(c)) return false;
+            if (memcmp(c.out.data() + hdrLen, c.buf.data(), n) != 0)
+                return c.fail("Verification failed: stored data does not match the source. Nothing was released.");
         } else {
             size_t nb = (n + c.cfg.block - 1) / c.cfg.block;
             std::vector<ZJob> jobs(nb);
