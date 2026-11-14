@@ -14,6 +14,7 @@
 #include <shobjidl.h>
 #include <uxtheme.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -80,7 +81,13 @@ static std::wstring getText(HWND h) {
     s.resize(n);
     return s;
 }
-static int msg(const std::wstring& text, UINT flags) { return MessageBoxW(g.wnd, text.c_str(), kTitle, flags); }
+static int themedBox(HWND owner, const std::wstring& text, const wchar_t* title, UINT flags);
+static int msg(const std::wstring& text, UINT flags) { return themedBox(g.wnd, text, kTitle, flags); }
+static void ensureFonts() {
+    if (g.font) return;
+    g.font = CreateFontW(-MulDiv(9, g.dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g.fontBig = CreateFontW(-MulDiv(15, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+}
 static const wchar_t* extFor(int fmt) { return fmt == nz::FZIP ? L".zip" : L".7z"; }
 static int curFormat() { return (int)SendMessageW(g.format, CB_GETCURSEL, 0, 0) == 1 ? nz::FZIP : nz::F7Z; }
 static int curLevel() { int v = (int)SendMessageW(g.level, CB_GETCURSEL, 0, 0); return v < 0 ? 1 : v; }
@@ -168,15 +175,128 @@ static void darkTitleBar(HWND h) {
 }
 static const wchar_t* themeLabel() { return T.pref == 1 ? L"Theme: Light" : T.pref == 2 ? L"Theme: Dark" : L"Theme: Auto"; }
 
+// Message box that follows the dark theme. In light mode the normal Windows message box is used.
+static const wchar_t* kBoxClass = L"NibbleZipBox";
+struct BoxState { int result = 0; bool done = false; int defId = 0, cancelId = 0; };
+static LRESULT CALLBACK boxProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    BoxState* st = (BoxState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_COMMAND: {
+        if (!st || HIWORD(wp) != BN_CLICKED) break;
+        int id = LOWORD(wp);
+        if (id == IDOK && !GetDlgItem(h, IDOK)) id = st->defId;                    // Enter key
+        if (id == IDCANCEL && !GetDlgItem(h, IDCANCEL)) { id = st->cancelId; if (!id) return 0; }   // Esc key
+        st->result = id; st->done = true;
+        return 0;
+    }
+    case WM_CLOSE:
+        if (st && st->cancelId) { st->result = st->cancelId; st->done = true; }
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+        SetTextColor((HDC)wp, T.text); SetBkColor((HDC)wp, T.ctl);
+        return (LRESULT)T.brCtl;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+static int themedBox(HWND owner, const std::wstring& text, const wchar_t* title, UINT flags) {
+    if (!T.dark) return MessageBoxW(owner, text.c_str(), title, flags);
+    ensureFonts();
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc; memset(&wc, 0, sizeof(wc));
+        wc.cbSize = sizeof(wc); wc.lpfnWndProc = boxProc; wc.hInstance = g.inst; wc.lpszClassName = kBoxClass;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = T.brCtl;
+        RegisterClassExW(&wc); reg = true;
+    }
+    UINT type = flags & MB_TYPEMASK;
+    struct Btn { int id; const wchar_t* label; };
+    std::vector<Btn> btns;
+    BoxState st;
+    if (type == MB_OKCANCEL) { btns = {{IDOK, L"OK"}, {IDCANCEL, L"Cancel"}}; st.cancelId = IDCANCEL; }
+    else if (type == MB_YESNO) { btns = {{IDYES, L"Yes"}, {IDNO, L"No"}}; st.cancelId = 0; }
+    else if (type == MB_YESNOCANCEL) { btns = {{IDYES, L"Yes"}, {IDNO, L"No"}, {IDCANCEL, L"Cancel"}}; st.cancelId = IDCANCEL; }
+    else { btns = {{IDOK, L"OK"}}; st.cancelId = IDOK; }
+    size_t def = (flags & MB_DEFMASK) == MB_DEFBUTTON2 ? 1 : (flags & MB_DEFMASK) == MB_DEFBUTTON3 ? 2 : 0;
+    if (def >= btns.size()) def = 0;
+    st.defId = btns[def].id;
+    LPCWSTR iconId = nullptr;
+    switch (flags & MB_ICONMASK) {
+        case MB_ICONWARNING: iconId = IDI_WARNING; break;
+        case MB_ICONERROR: iconId = IDI_ERROR; break;
+        case MB_ICONQUESTION: iconId = IDI_QUESTION; break;
+        case MB_ICONINFORMATION: iconId = IDI_INFORMATION; break;
+    }
+    // Measure the text.
+    const int pad = S(20), iconW = iconId ? S(32) + S(14) : 0, maxW = S(440), minW = S(240);
+    HDC dc = GetDC(nullptr); HFONT old = (HFONT)SelectObject(dc, g.font);
+    RECT one = {0, 0, 0, 0}; DrawTextW(dc, text.c_str(), -1, &one, DT_CALCRECT | DT_NOPREFIX);
+    int tw = std::min(maxW, std::max(minW, (int)one.right + S(4)));
+    RECT tr = {0, 0, tw, 0}; DrawTextW(dc, text.c_str(), -1, &tr, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, old); ReleaseDC(nullptr, dc);
+    int th = std::max((int)tr.bottom, iconId ? S(32) : 0);
+    const int bw = S(88), bh = S(28), gap = S(8);
+    int cw = pad + iconW + tw + pad;
+    int needBtn = (int)btns.size() * bw + ((int)btns.size() - 1) * gap + 2 * pad;
+    if (cw < needBtn) cw = needBtn;
+    int ch = pad + th + S(22) + bh + S(16);
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT wr = {0, 0, cw, ch}; AdjustWindowRectEx(&wr, style, FALSE, WS_EX_DLGMODALFRAME);
+    int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
+    RECT orc;
+    if (owner && IsWindowVisible(owner)) GetWindowRect(owner, &orc);
+    else { orc.left = 0; orc.top = 0; orc.right = GetSystemMetrics(SM_CXSCREEN); orc.bottom = GetSystemMetrics(SM_CYSCREEN); }
+    int x = orc.left + ((orc.right - orc.left) - ww) / 2, y = orc.top + ((orc.bottom - orc.top) - wh) / 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, kBoxClass, title, style, x, y, ww, wh, owner, nullptr, g.inst, nullptr);
+    if (!h) return MessageBoxW(owner, text.c_str(), title, flags);
+    SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)&st);
+    darkTitleBar(h);
+    if (iconId) {
+        HWND ic = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ICON, pad, pad, S(32), S(32), h, nullptr, g.inst, nullptr);
+        SendMessageW(ic, STM_SETICON, (WPARAM)LoadIconW(nullptr, iconId), 0);
+    }
+    HWND tx = CreateWindowExW(0, L"STATIC", text.c_str(), WS_CHILD | WS_VISIBLE | SS_NOPREFIX, pad + iconW, pad, tw, th, h, nullptr, g.inst, nullptr);
+    SendMessageW(tx, WM_SETFONT, (WPARAM)g.font, TRUE);
+    int bx = cw - pad - (int)btns.size() * bw - ((int)btns.size() - 1) * gap, by = pad + th + S(22);
+    HWND defBtn = nullptr;
+    for (size_t i = 0; i < btns.size(); i++) {
+        HWND b = CreateWindowExW(0, L"BUTTON", btns[i].label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | (i == def ? BS_DEFPUSHBUTTON : 0),
+                                 bx + (int)i * (bw + gap), by, bw, bh, h, (HMENU)(INT_PTR)btns[i].id, g.inst, nullptr);
+        SendMessageW(b, WM_SETFONT, (WPARAM)g.font, TRUE);
+        darken(b, L"DarkMode_Explorer");
+        if (i == def) defBtn = b;
+    }
+    bool ownerWasEnabled = owner && IsWindowEnabled(owner);
+    if (owner) EnableWindow(owner, FALSE);
+    ShowWindow(h, SW_SHOW);
+    SetForegroundWindow(h);
+    if (defBtn) SetFocus(defBtn);
+    MSG m;
+    while (!st.done) {
+        BOOL r = GetMessageW(&m, nullptr, 0, 0);
+        if (r <= 0) { if (r == 0) PostQuitMessage((int)m.wParam); st.result = st.cancelId ? st.cancelId : st.defId; break; }
+        if (IsDialogMessageW(h, &m)) continue;
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    if (owner && ownerWasEnabled) EnableWindow(owner, TRUE);
+    SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+    DestroyWindow(h);
+    if (owner && ownerWasEnabled) SetForegroundWindow(owner);
+    return st.result;
+}
+
 static bool acceptDisclaimer() {
     if (regGet(L"DisclaimerAccepted", 0) == 1) return true;
-    int r = MessageBoxW(nullptr,
+    int r = themedBox(nullptr,
         L"NibbleZip permanently deletes your original files as it compresses them. That is its purpose, and it cannot be undone.\n\n"
         L"This software is provided \"as is\", without warranty of any kind. The authors and contributors are not responsible or liable "
         L"for any loss of data or any other damage arising from its use. You use it entirely at your own risk.\n\n"
         L"Keep a backup of anything you cannot afford to lose.\n\n"
         L"Press OK to accept these terms and continue, or Cancel to exit.",
-        L"NibbleZip – please read", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND);
+        L"NibbleZip – please read", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
     if (r != IDOK) return false;
     regSet(L"DisclaimerAccepted", 1);
     return true;
@@ -417,7 +537,7 @@ static void onProgress() {
     wchar_t pct[32]; _snwprintf(pct, 31, L"%.1f%%", frac * 100); pct[31] = 0;
     std::wstring s2 = std::wstring(pct);
     if (g.verifying) s2 += L"   •   Read " + W(nz::humanSize(p.doneBytes)) + L" of " + W(nz::humanSize(p.totalBytes));
-    else s2 += L"   •   Archive: " + W(nz::humanSize(p.packedBytes)) + L"   •   Space reclaimed: " + W(nz::humanSize(p.reclaimedBytes)) +
+    else s2 += L"   •   Archive: " + W(nz::humanSize(p.packedBytes)) + L"   •   Originals removed: " + W(nz::humanSize(p.reclaimedBytes)) +
                L"   •   Files: " + std::to_wstring(p.filesDone) + L" of " + std::to_wstring(p.filesTotal);
     double el = (double)(now - g.startTick) / 1000.0;
     if (g.haveStart && el > 8 && p.doneBytes > g.startDone && p.totalBytes > p.doneBytes && !g.pauseFlag.load()) {
@@ -443,8 +563,12 @@ static void onDone() {
         return;
     }
     std::wstring t; UINT icon = MB_ICONINFORMATION;
-    std::wstring stats = std::to_wstring(r.final.filesDone) + L" file(s) stored.  Archive size: " + W(nz::humanSize(r.final.packedBytes)) +
-                         L".  Space reclaimed: " + W(nz::humanSize(r.final.reclaimedBytes)) + L".";
+    std::wstring stats = std::to_wstring(r.final.filesDone) + L" file(s) stored in the archive.\nArchive size: " + W(nz::humanSize(r.final.packedBytes));
+    if (r.final.reclaimedBytes > 0) {
+        stats += L"\nOriginals removed: " + W(nz::humanSize(r.final.reclaimedBytes));
+        if (r.final.reclaimedBytes >= r.final.packedBytes) stats += L"\nNet space saved: " + W(nz::humanSize(r.final.reclaimedBytes - r.final.packedBytes));
+        else stats += L"\nNet space saved: none (the archive is " + W(nz::humanSize(r.final.packedBytes - r.final.reclaimedBytes)) + L" larger than what was removed)";
+    } else if (r.ok) stats += L"\nOriginals were kept.";
     if (r.ok && !r.partial) { t = L"All done.\n\n" + stats; }
     else if (r.ok) { t = L"The archive was closed early and is complete as it stands.\n\n" + stats + L"\n\nFiles that were not reached are still on disk, untouched."; }
     else if (r.paused) { t = L"Stopped. Nothing is lost: everything stored so far is safe and the job was saved.\n\nStart NibbleZip again to resume it.\n\n" + stats; }
@@ -480,6 +604,7 @@ static void onStart() {
     if (plat::stat(arc, st) && nz::loadJob(arc, ji)) { offerResume(ji); return; }
     nz::Options opt; opt.inputs = g.items; opt.archive = arc; opt.format = curFormat(); opt.level = curLevel();
     opt.eat = SendMessageW(g.eat, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    regSet(L"Format", opt.format == nz::FZIP ? 1 : 0); regSet(L"Level", (DWORD)opt.level);   // remembered for next time
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     nz::Preflight pf = nz::preflight(opt);
     SetCursor(old);
@@ -545,8 +670,7 @@ static LRESULT CALLBACK listSub(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, 
 }
 
 static void createControls() {
-    g.font = CreateFontW(-MulDiv(9, g.dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    g.fontBig = CreateFontW(-MulDiv(15, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    ensureFonts();
     const int M = 20, CW = 640 - 2 * M;
     HWND title = mk(L"STATIC", L"NibbleZip", 0, 0, M, 14, 280, 30, -1);
     SendMessageW(title, WM_SETFONT, (WPARAM)g.fontBig, TRUE);
@@ -584,12 +708,12 @@ static void createControls() {
     g.format = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, M + 62, 356, 220, 200, ID_FORMAT);
     SendMessageW(g.format, CB_ADDSTRING, 0, (LPARAM)L"7z  –  smallest files");
     SendMessageW(g.format, CB_ADDSTRING, 0, (LPARAM)L"ZIP  –  opens everywhere");
-    SendMessageW(g.format, CB_SETCURSEL, 0, 0);
+    SendMessageW(g.format, CB_SETCURSEL, regGet(L"Format", 0) == 1 ? 1 : 0, 0);
     mk(L"STATIC", L"Compression:", 0, 0, M + 310, 360, 84, 18, -1);
     g.level = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, M + 396, 356, CW - 396, 200, ID_LEVEL);
     const wchar_t* lv[4] = {L"Fast", L"Normal", L"Maximum", L"Ultra (slow, most RAM)"};
     for (auto s : lv) SendMessageW(g.level, CB_ADDSTRING, 0, (LPARAM)s);
-    SendMessageW(g.level, CB_SETCURSEL, 1, 0);
+    SendMessageW(g.level, CB_SETCURSEL, std::min<DWORD>(3, regGet(L"Level", 1)), 0);
 
     // The tick box and its text are separate controls so the text colour follows the theme.
     g.eat = mk(L"BUTTON", L"", BS_AUTOCHECKBOX | WS_TABSTOP, 0, M, 397, 18, 18, ID_EAT);
@@ -757,13 +881,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         }
     }
 
-    if (!acceptDisclaimer()) return 0;
-    initTheme();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     INITCOMMONCONTROLSEX icc; icc.dwSize = sizeof(icc); icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
     HDC dc = GetDC(nullptr); g.dpi = GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(nullptr, dc);
     if (g.dpi < 96) g.dpi = 96;
+    initTheme();
+    if (!acceptDisclaimer()) return 0;
 
     WNDCLASSEXW wc; memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc); wc.lpfnWndProc = wndProc; wc.hInstance = inst; wc.lpszClassName = kClass;

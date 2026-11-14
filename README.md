@@ -23,6 +23,9 @@ damage arising from its use. Keep a backup of anything you cannot afford to lose
 **Check an archive** re-reads a finished 7z or ZIP from disk, decompresses every file and compares
 it with its stored checksum. **Theme** switches between following Windows, light and dark.
 
+The format and compression level you last used are remembered. At the end of a job the app
+reports the archive size, how much of the originals it removed, and the net space saved.
+
 Data that is already compressed (video, music, zips, most game archives) is detected by sampling
 and stored as it is instead of being recompressed, which is many times faster for almost no size
 difference.

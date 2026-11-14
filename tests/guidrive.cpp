@@ -6,7 +6,7 @@
 static HWND g_dlg;
 static BOOL CALLBACK findDlg(HWND h, LPARAM) {
     wchar_t cls[64]; GetClassNameW(h, cls, 63);
-    if (!wcscmp(cls, L"#32770") && IsWindowVisible(h)) { g_dlg = h; return FALSE; }
+    if ((!wcscmp(cls, L"#32770") || !wcscmp(cls, L"NibbleZipBox")) && IsWindowVisible(h)) { g_dlg = h; return FALSE; }
     return TRUE;
 }
 static BOOL CALLBACK dumpChild(HWND h, LPARAM) {

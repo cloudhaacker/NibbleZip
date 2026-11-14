@@ -1035,7 +1035,12 @@ Result run(const Options& opt0, Callbacks& cb) {
         todo.push_back(f);
     }
     // Sources that were verified and journaled, but the crash came before they were deleted.
-    if (resume && c.opt.eat) for (auto& e : c.st.entries) deleteSource(c, e);
+    if (resume && c.opt.eat) {
+        uint64_t gone = 0;
+        for (auto& e : c.st.entries) { deleteSource(c, e); plat::Stat s; if (!plat::stat(e.src, s)) gone += e.size; }
+        if (c.st.part.active && c.holes) gone += c.st.part.offset;
+        c.pr.reclaimedBytes = gone;   // total removed over the whole job, not just this session
+    }
     tick(c, true);
 
     bool okSoFar = true;
