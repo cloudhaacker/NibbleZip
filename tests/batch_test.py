@@ -107,8 +107,8 @@ def main():
             n += STRIDE; count += 1
         print(fmt, "crash mid-batch and continue OK (%d scenarios)" % count, flush=True)
     log = open(ROOT + "/home/deleted-files.log").read()
-    assert "game 00.nes" in log and "\tdeleted\t" in log, "deletion log missing entries"
-    print("deletion log OK (%d lines)" % log.count("\n"))
+    assert "game 00.nes" in log and "deleted" in log and "stored in:" in log, "deletion log missing entries"
+    print("deletion log OK (%d entries)" % log.count("stored in:"))
     print("BATCH TESTS PASSED")
 
 main()

@@ -65,6 +65,7 @@ int main(int argc, char** argv) {
         else if (a == "-l" && i + 1 < argc) o.level = atoi(argv[++i]);
         else if (a == "-o" && i + 1 < argc) o.archive = argv[++i];
         else if (a == "--keep") o.eat = false;
+        else if (a == "--split" && i + 1 < argc) o.split = strtoull(argv[++i], nullptr, 10);
         else if (a == "--each" && i + 1 < argc) each = !strcmp(argv[++i], "file") ? nz::OutPerFile : nz::OutPerItem;
         else if (a == "--outdir" && i + 1 < argc) outDir = argv[++i];
         else if (a == "--finalize") o.finalizeOnly = true;

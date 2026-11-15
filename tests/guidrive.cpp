@@ -31,6 +31,12 @@ int main(int argc, char** argv) {
             SendMessageW(w, WM_COMMAND, MAKEWPARAM(id, CBN_SELCHANGE), (LPARAM)GetDlgItem(w, id));
             continue;
         }
+        if (!strcmp(argv[i], "settext")) {   // settext <id> <text>
+            int id = atoi(argv[++i]); HWND w = FindWindowW(L"NibbleZipMainWindow", 0);
+            wchar_t t[512]; MultiByteToWideChar(CP_UTF8, 0, argv[++i], -1, t, 511);
+            SetWindowTextW(GetDlgItem(w, id), t);
+            continue;
+        }
         if (!strcmp(argv[i], "dialog")) {   // dialog <buttonId> : wait for a message box, print its text, press the button
             int id = atoi(argv[++i]); g_dlg = 0;
             for (int t = 0; t < 600 && !g_dlg; t++) { EnumWindows(findDlg, 0); if (!g_dlg) Sleep(100); }

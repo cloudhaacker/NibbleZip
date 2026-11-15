@@ -15,6 +15,6 @@ for f in adler32 crc32 deflate inflate inffast inftrees trees zutil; do
   OBJ="$OBJ build/win/z_$f.o"
 done
 CXX="$ZIG c++ $T -std=c++17 -O2 -DNDEBUG -Wall -Wextra -municode -I$SDK -I$ZL"
-$CXX src/engine.cpp src/batch.cpp src/verify.cpp src/platform.cpp src/gui.cpp res/nibblezip.rc $OBJ -Wl,--subsystem,windows -lcomctl32 -luxtheme -lcomdlg32 -lole32 -luuid -lshell32 -ladvapi32 -lgdi32 -o build/win/NibbleZip.exe
-$CXX src/engine.cpp src/batch.cpp src/verify.cpp src/platform.cpp src/cli.cpp res/cli.rc $OBJ -ladvapi32 -o build/win/nibblezip-cli.exe
+$CXX src/engine.cpp src/arcfile.cpp src/batch.cpp src/verify.cpp src/platform.cpp src/gui.cpp res/nibblezip.rc $OBJ -Wl,--subsystem,windows -lcomctl32 -luxtheme -lcomdlg32 -lole32 -luuid -lshell32 -ladvapi32 -lgdi32 -o build/win/NibbleZip.exe
+$CXX src/engine.cpp src/arcfile.cpp src/batch.cpp src/verify.cpp src/platform.cpp src/cli.cpp res/cli.rc $OBJ -ladvapi32 -o build/win/nibblezip-cli.exe
 ls -la build/win/*.exe

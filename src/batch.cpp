@@ -108,8 +108,7 @@ BatchPlan planBatch(const Options& base, int mode, const std::string& outDir0) {
     for (auto& c : cands) {
         auto pit = pendingByInput.find(plat::pathKey(c.src));
         if (pit != pendingByInput.end()) {
-            plat::Stat ast;
-            if (plat::stat(pit->second.archive, ast)) {
+            if (archiveExists(pit->second.archive)) {
                 BatchJob j; j.opt = base; j.opt.archive = pit->second.archive; j.opt.inputs = pit->second.opt.inputs; j.opt.finalizeOnly = false; j.bytes = c.bytes;
                 taken.insert(plat::pathKey(pit->second.archive));
                 plan.totalBytes += c.bytes; plan.largestJob = std::max(plan.largestJob, c.bytes);
@@ -121,8 +120,8 @@ BatchPlan planBatch(const Options& base, int mode, const std::string& outDir0) {
         std::string arc = plat::join(c.destDir, c.stem + ext), key = plat::pathKey(arc);
         if (uses[key] > 1 || srcKeys.count(key)) { arc = plat::join(c.destDir, c.full + ext); key = plat::pathKey(arc); }
         if (!taken.insert(key).second || srcKeys.count(key)) { clash++; continue; }
-        plat::Stat st; JobInfo ji;
-        if (plat::stat(arc, st) && !loadJob(arc, ji)) { exists++; continue; }   // finished earlier: leave it and its original alone
+        JobInfo ji;
+        if (archiveExists(arc) && !loadJob(arc, ji)) { exists++; continue; }   // finished earlier: leave it and its original alone
         BatchJob j; j.opt = base; j.opt.inputs.assign(1, c.src); j.opt.archive = arc; j.opt.finalizeOnly = false; j.bytes = c.bytes;
         plan.totalBytes += c.bytes; plan.largestJob = std::max(plan.largestJob, c.bytes);
         plan.jobs.push_back(std::move(j));
@@ -132,8 +131,7 @@ BatchPlan planBatch(const Options& base, int mode, const std::string& outDir0) {
         std::vector<std::string> roots;
         for (auto& in0 : base.inputs) roots.push_back(plat::pathKey(in0));
         for (auto& ji : pending) {
-            plat::Stat ast;
-            if (ji.opt.inputs.size() != 1 || taken.count(plat::pathKey(ji.archive)) || !plat::stat(ji.archive, ast)) continue;
+            if (ji.opt.inputs.size() != 1 || taken.count(plat::pathKey(ji.archive)) || !archiveExists(ji.archive)) continue;
             std::string k = plat::pathKey(ji.opt.inputs[0]); bool under = false;
             for (auto& r : roots) if (k == r || (k.size() > r.size() && k.compare(0, r.size(), r) == 0 && (k[r.size()] == '/' || k[r.size()] == '\\'))) under = true;
             if (!under) continue;

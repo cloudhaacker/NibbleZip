@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "platform.h"
+#include "arcfile.h"
 
 #include <algorithm>
 #include <atomic>
@@ -67,7 +68,7 @@ struct State {
     uint64_t dataEnd = 0;
     PartState part;
 };
-struct JHeader { int format = 0, level = 1; bool eat = true; std::string archive; std::vector<std::string> inputs; };
+struct JHeader { int format = 0, level = 1; bool eat = true; std::string archive; std::vector<std::string> inputs; uint64_t split = 0; };
 
 const uint32_t JMAGIC = 0x314A5A4E; // "NZJ1"
 enum { R_HEADER = 1, R_BATCH = 2, R_PART = 3, R_EMPTY = 4 };
@@ -100,6 +101,7 @@ static size_t parseJournal(const std::vector<uint8_t>& b, JHeader& h, State& st)
             uint32_t n = r.u32();
             for (uint32_t i = 0; i < n && !r.bad; i++) h.inputs.push_back(r.str());
             if (r.bad) break;
+            if (r.pos + 8 <= r.n) h.split = r.u64();   // added in 0.5; older journals have no such field
             st.dataEnd = h.format == F7Z ? 32 : 0;
             haveHeader = true;
         } else if (type == R_BATCH) {
@@ -206,6 +208,11 @@ struct Plan {
     uint64_t total = 0, largest = 0;
 };
 
+static std::string g_scanArchiveKey;   // parts of the archive being written are never treated as input
+static bool excluded(const std::set<std::string>& exclude, const std::string& p) {
+    std::string k = plat::pathKey(p);
+    return exclude.count(k) || (!g_scanArchiveKey.empty() && ArcFile::isPartOf(k, g_scanArchiveKey));
+}
 static void scanDir(const std::string& dir, const std::string& rel, const std::set<std::string>& exclude, Plan& plan) {
     std::vector<plat::DirEnt> ents;
     if (!plat::listDir(dir, ents)) { plan.skipped.push_back("Could not read folder: " + dir); return; }
@@ -217,7 +224,7 @@ static void scanDir(const std::string& dir, const std::string& rel, const std::s
             plan.dirs.push_back(d);
             scanDir(p, r, exclude, plan);
         } else {
-            if (exclude.count(plat::pathKey(p))) continue;
+            if (excluded(exclude, p)) continue;
             PlanFile f; f.src = p; f.rel = r; f.size = e.st.size; f.mtime = e.st.mtime; f.attr = e.st.attr;
             plan.total += f.size; plan.largest = std::max(plan.largest, f.size);
             plan.files.push_back(std::move(f));
@@ -229,6 +236,7 @@ static bool scan(const std::vector<std::string>& inputs, const std::string& arch
     std::set<std::string> exclude;
     exclude.insert(plat::pathKey(archive));
     exclude.insert(plat::pathKey(journalPathFor(archive)));
+    g_scanArchiveKey = plat::pathKey(archive);
     std::set<std::string> names;
     for (auto& in0 : inputs) {
         std::string in = plat::absPath(in0);
@@ -246,7 +254,7 @@ static bool scan(const std::vector<std::string>& inputs, const std::string& arch
             plan.dirs.push_back(d);
             scanDir(in, name, exclude, plan);
         } else {
-            if (exclude.count(plat::pathKey(in))) continue;
+            if (excluded(exclude, in)) continue;
             PlanFile f; f.src = in; f.rel = name; f.size = st.size; f.mtime = st.mtime; f.attr = st.attr;
             plan.total += f.size; plan.largest = std::max(plan.largest, f.size);
             plan.files.push_back(std::move(f));
@@ -304,7 +312,7 @@ static size_t outWrite(ISeqOutStreamPtr pp, const void* data, size_t size) {
 }
 
 struct Ctx {
-    Options opt; Callbacks* cb = nullptr; State st; plat::File arc; Journal j; Progress pr; Result res;
+    Options opt; Callbacks* cb = nullptr; State st; ArcFile arc; Journal j; Progress pr; Result res;
     StepCfg cfg; std::string archive, arcDir; int stop = 0; bool holes = true;
     uint64_t stepBase = 0, stepOut = 0; uint64_t idxEst = 4096; bool journalBroken = false;
     std::chrono::steady_clock::time_point lastTick;
@@ -667,7 +675,8 @@ static void logDeleted(Ctx& c, const std::string& path, uint64_t size) {
     if (localtime_r(&now, &lt))
 #endif
         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &lt);
-    std::string line = std::string(ts) + "\tdeleted\t" + path + "\t" + std::to_string(size) + " bytes\tstored in\t" + c.archive + "\r\n";
+    std::string line = std::string(ts) + "   deleted   (" + humanSize(size) + ")\r\n    " + path + "\r\n    stored in: " + c.archive +
+                       (c.opt.split ? ".001 (and following parts)" : "") + "\r\n\r\n";
     lf.writeAt(pos, line.data(), line.size());
 }
 
@@ -884,7 +893,7 @@ static bool processLarge(Ctx& c, const PlanFile& f, bool resuming) {
 }
 
 static bool openArchiveNew(Ctx& c) {
-    if (!c.arc.open(c.archive, plat::OpenRWCreateNew)) return c.fail("Cannot create archive " + c.archive + ": " + plat::lastError(), false);
+    if (!c.arc.create(c.archive, c.opt.split)) return c.fail("Cannot create archive " + c.archive + ": " + plat::lastError(), false);
     if (c.opt.format == F7Z) {
         std::vector<uint8_t> sh = build7zStart(0, 0, 0);
         if (!c.arc.writeAt(0, sh.data(), sh.size()) || !c.arc.flush()) return c.fail("Cannot write archive: " + plat::lastError(), false);
@@ -898,10 +907,11 @@ static bool openArchiveNew(Ctx& c) {
 // ---------------------------------------------------------------- public API
 std::string journalPathFor(const std::string& archive) { return archive + ".nzj"; }
 void discardStaleJournal(const std::string& archive0) {
-    std::string archive = plat::absPath(archive0); plat::Stat st;
-    if (plat::stat(archive, st)) return;
+    std::string archive = plat::absPath(archive0);
+    if (ArcFile::exists(archive)) return;
     plat::removeFile(journalPathFor(archive)); plat::removeFile(mirrorPathFor(archive));
 }
+bool archiveExists(const std::string& archive) { return ArcFile::exists(plat::absPath(archive)); }
 std::string deletionLogPath() { return plat::join(plat::appDataDir(), "deleted-files.log"); }
 
 std::string humanSize(uint64_t n) {
@@ -922,7 +932,8 @@ Preflight preflight(const Options& opt) {
     std::string archive = plat::absPath(opt.archive), dir = plat::parentDir(archive);
     plat::Stat st;
     if (!plat::stat(dir, st) || !st.isDir) { pf.error = "The archive folder does not exist: " + dir; return pf; }
-    if (plat::stat(archive, st)) { pf.error = "A file with that archive name already exists. Pick another name."; return pf; }
+    if (ArcFile::exists(archive)) { pf.error = "A file with that archive name already exists. Pick another name."; return pf; }
+    if (opt.split && opt.split < (1u << 20) && !opt.testStep) { pf.error = "Parts must be at least 1 MB."; return pf; }
     Plan plan; std::string err;
     if (!scan(opt.inputs, archive, plan, err, false)) { pf.error = err; return pf; }
     pf.totalBytes = plan.total; pf.files = plan.files.size(); pf.dirs = plan.dirs.size(); pf.largest = plan.largest;
@@ -968,7 +979,7 @@ bool loadJob(const std::string& archive0, JobInfo& info) {
     JHeader h; State st; std::vector<uint8_t> bytes;
     if (!loadJournal(archive, h, st, bytes)) return false;
     info = JobInfo();
-    info.archive = archive; info.opt.archive = archive; info.opt.format = h.format; info.opt.level = h.level; info.opt.eat = h.eat; info.opt.inputs = h.inputs;
+    info.archive = archive; info.opt.archive = archive; info.opt.format = h.format; info.opt.level = h.level; info.opt.eat = h.eat; info.opt.inputs = h.inputs; info.opt.split = h.split;
     info.midFile = st.part.active; info.midFileName = st.part.e.rel; info.filesDone = st.entries.size(); info.packedBytes = st.dataEnd;
     return true;
 }
@@ -981,8 +992,7 @@ std::vector<JobInfo> pendingJobs() {
         std::string p = plat::join(mirrorDir(), e.name);
         std::vector<uint8_t> b; JHeader h; State st;
         if (!readAll(p, b) || !parseJournal(b, h, st)) continue;
-        plat::Stat s;
-        if (!plat::stat(h.archive, s)) continue;
+        if (!ArcFile::exists(h.archive)) continue;
         JobInfo ji;
         if (loadJob(h.archive, ji)) out.push_back(ji);
     }
@@ -1001,18 +1011,17 @@ Result run(const Options& opt0, Callbacks& cb) {
     JHeader jh; std::vector<uint8_t> jbytes; State loaded;
     bool resume = loadJournal(c.archive, jh, loaded, jbytes);
     if (resume) {
-        plat::Stat as;
-        if (!plat::stat(c.archive, as)) {   // journal left over from an archive that no longer exists
+        if (!ArcFile::exists(c.archive)) {   // journal left over from an archive that no longer exists
             plat::removeFile(journalPathFor(c.archive)); plat::removeFile(mirrorPathFor(c.archive));
             resume = false; loaded = State();
             // Nothing had been written yet: start that job over with the settings it was given.
-            if (c.opt.inputs.empty()) { c.opt.inputs = jh.inputs; c.opt.format = jh.format; c.opt.level = jh.level; c.opt.eat = jh.eat; c.opt.finalizeOnly = false; }
+            if (c.opt.inputs.empty()) { c.opt.inputs = jh.inputs; c.opt.format = jh.format; c.opt.level = jh.level; c.opt.eat = jh.eat; c.opt.split = jh.split; c.opt.finalizeOnly = false; }
         }
     }
     if (resume) {
         c.st = std::move(loaded);
-        c.opt.format = jh.format; c.opt.level = jh.level; c.opt.eat = jh.eat; c.opt.inputs = jh.inputs;
-        if (!c.arc.open(c.archive, plat::OpenRWExisting)) { c.fail("Cannot open archive " + c.archive + ": " + plat::lastError()); return finish(); }
+        c.opt.format = jh.format; c.opt.level = jh.level; c.opt.eat = jh.eat; c.opt.inputs = jh.inputs; c.opt.split = jh.split;
+        if (!c.arc.openExisting(c.archive, c.opt.split, false)) { c.fail("Cannot open archive " + c.archive + ": " + plat::lastError()); return finish(); }
         uint64_t sz = 0; c.arc.size(sz);
         if (sz < c.st.dataEnd) { c.fail("The archive is shorter than its journal says. It may have been modified; not continuing.", false); return finish(); }
         if (!c.j.start(c.archive, jbytes)) { c.fail("Cannot open the journal: " + plat::lastError()); return finish(); }
@@ -1024,6 +1033,7 @@ Result run(const Options& opt0, Callbacks& cb) {
         Buf h; h.u8(R_HEADER); h.u32(JMAGIC); h.u8((uint8_t)c.opt.format); h.u8((uint8_t)c.opt.level); h.u8(c.opt.eat ? 1 : 0); h.str(c.archive);
         h.u32((uint32_t)c.opt.inputs.size());
         for (auto& in : c.opt.inputs) h.str(plat::absPath(in));
+        h.u64(c.opt.split);
         if (!c.j.start(c.archive, std::vector<uint8_t>()) || !c.j.append(h)) { c.fail("Cannot create the journal: " + plat::lastError(), false); c.j.destroy(); return finish(); }
         CP("journal-created");
         if (!openArchiveNew(c)) { c.j.destroy(); return finish(); }

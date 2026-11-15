@@ -14,6 +14,7 @@ struct Options {
     int format = F7Z;
     int level = 1;            // 0 fast, 1 normal, 2 maximum, 3 ultra
     bool eat = true;          // release sources as they are verified in the archive
+    uint64_t split = 0;       // 0 = one file; otherwise write parts of this many bytes (name.7z.001, .002, ...)
     bool finalizeOnly = false; // resume: just close the archive with what is already inside
     uint64_t testStep = 0;    // testing: force a tiny step size
 };
@@ -88,5 +89,6 @@ bool loadJob(const std::string& archive, JobInfo& info);
 std::vector<JobInfo> pendingJobs();
 std::string journalPathFor(const std::string& archive);
 std::string humanSize(uint64_t n);
+bool archiveExists(const std::string& archive);   // as a single file or as split parts
 
 } // namespace nz

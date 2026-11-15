@@ -1,6 +1,7 @@
 // Archive checker: reads a finished 7z or ZIP from disk, decompresses everything and compares checksums.
 #include "engine.h"
 #include "platform.h"
+#include "arcfile.h"
 
 #include <algorithm>
 #include <cstring>
@@ -16,7 +17,7 @@ namespace nz {
 namespace {
 
 struct VCtx {
-    plat::File f; uint64_t size = 0; Callbacks* cb = nullptr; Progress pr; VerifyResult res; int ticks = 0;
+    ArcFile f; uint64_t size = 0; Callbacks* cb = nullptr; Progress pr; VerifyResult res; int ticks = 0;
     bool fail(const std::string& m) { if (res.error.empty()) res.error = m; return false; }
     bool step(uint64_t done) {
         pr.doneBytes = done;
@@ -45,7 +46,7 @@ static std::string utf8From16(const uint16_t* s, size_t n) {
 }
 
 // ---------------------------------------------------------------- 7z
-struct SeekIn { ISeekInStream vt; plat::File* f; uint64_t pos; uint64_t size; };
+struct SeekIn { ISeekInStream vt; ArcFile* f; uint64_t pos; uint64_t size; };
 static SRes siRead(ISeekInStreamPtr pp, void* buf, size_t* size) {
     SeekIn* s = Z7_CONTAINER_FROM_VTBL(pp, SeekIn, vt);
     size_t got = 0;
@@ -241,10 +242,13 @@ VerifyResult verifyArchive(const std::string& archive0, Callbacks& cb) {
     static bool crcReady = false;
     if (!crcReady) { CrcGenerateTable(); crcReady = true; }
     VCtx c; c.cb = &cb;
-    std::string archive = plat::absPath(archive0);
+    std::string archive, picked = plat::absPath(archive0); uint64_t partSize = 0;
+    ArcFile::detect(picked, archive, partSize);   // picking the .001 part checks the whole split archive
     plat::Stat st;
     if (plat::stat(journalPathFor(archive), st)) { c.fail("This archive belongs to an unfinished job. Resume or close that job first."); return c.res; }
-    if (!c.f.open(archive, plat::OpenRead) || !c.f.size(c.size)) { c.fail("Cannot open the archive: " + plat::lastError()); return c.res; }
+    if (!c.f.openExisting(archive, partSize, true) || !c.f.size(c.size)) {
+        c.fail(partSize ? "Cannot open the archive parts. A part may be missing or incomplete." : "Cannot open the archive: " + plat::lastError()); return c.res;
+    }
     uint8_t sig[6] = {0}; size_t got = 0;
     c.f.readAt(0, sig, 6, got);
     c.pr.totalBytes = c.size; c.pr.filesTotal = 0;

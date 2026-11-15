@@ -29,6 +29,11 @@ ROM folder where every game becomes its own zip). Separate archives are named af
 originals and go next to them, or into a folder you pick. Items whose archive already exists are
 left alone, so pressing Start again after a stop simply carries on.
 
+**Split into parts** writes the archive as `name.7z.001`, `name.7z.002` and so on, each of the
+size you choose (pick a preset or type one, such as `250 MB`). Open or check a split archive by
+choosing its `.001` part; all parts must be in the same folder. 7-Zip, WinRAR and PeaZip open these
+parts directly. Windows' built-in zip viewer does not, so join or extract them with one of those.
+
 **Deletion log** opens a plain text list of every original NibbleZip has removed, with the date,
 size and the archive it went into (`%LOCALAPPDATA%\NibbleZip\deleted-files.log`).
 
