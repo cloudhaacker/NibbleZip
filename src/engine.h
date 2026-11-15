@@ -21,6 +21,7 @@ struct Options {
 struct Progress {
     uint64_t totalBytes = 0, doneBytes = 0, packedBytes = 0, reclaimedBytes = 0;
     uint64_t filesTotal = 0, filesDone = 0;
+    uint64_t jobIndex = 0, jobCount = 0;   // when several archives are being made in one go
     std::string current;
 };
 
@@ -62,6 +63,22 @@ struct VerifyResult {
     std::string error;
     uint64_t files = 0, bytes = 0;
 };
+
+// ---- several archives in one go (one per item, or one per file)
+enum OutputMode { OutSingle = 0, OutPerItem = 1, OutPerFile = 2 };
+struct BatchJob { Options opt; uint64_t bytes = 0; };
+struct BatchPlan {
+    std::vector<BatchJob> jobs;
+    std::vector<std::string> notes;
+    std::string error;
+    uint64_t totalBytes = 0, largestJob = 0;
+};
+struct BatchResult { Result r; uint64_t done = 0, total = 0, skipped = 0; };
+// outDir empty = put each archive next to its original.
+BatchPlan planBatch(const Options& base, int mode, const std::string& outDir);
+BatchResult runBatch(const std::vector<BatchJob>& jobs, Callbacks& cb);
+std::string deletionLogPath();
+void discardStaleJournal(const std::string& archive);   // only acts when the archive itself does not exist
 
 Preflight preflight(const Options& opt);
 // Reads a finished 7z or ZIP archive from disk, decompresses every file and checks it against its stored checksum.

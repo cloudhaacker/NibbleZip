@@ -32,7 +32,7 @@ static const wchar_t* kMenuText = L"Compress and reclaim space (NibbleZip)";
 #define NZ_COPYDATA_ADD 0x4E5A0001
 
 enum { ID_LIST = 100, ID_ADDFILES, ID_ADDFOLDER, ID_REMOVE, ID_CLEAR, ID_ARCHIVE, ID_BROWSE, ID_FORMAT, ID_LEVEL, ID_EAT,
-       ID_START, ID_PAUSE, ID_STOP, ID_MENU, ID_VERIFY, ID_THEME, ID_EATLABEL };
+       ID_START, ID_PAUSE, ID_STOP, ID_MENU, ID_VERIFY, ID_THEME, ID_EATLABEL, ID_OUTPUT, ID_LOG };
 
 static std::wstring W(const std::string& s) {
     if (s.empty()) return std::wstring();
@@ -54,12 +54,14 @@ struct App {
     HWND wnd = nullptr, list = nullptr, archive = nullptr, format = nullptr, level = nullptr, eat = nullptr, info = nullptr,
          bar = nullptr, st1 = nullptr, st2 = nullptr, start = nullptr, pause = nullptr, stop = nullptr, menuBtn = nullptr,
          addFiles = nullptr, addFolder = nullptr, removeBtn = nullptr, clearBtn = nullptr, browse = nullptr,
-         eatLabel = nullptr, verifyBtn = nullptr, themeBtn = nullptr;
+         eatLabel = nullptr, verifyBtn = nullptr, themeBtn = nullptr, output = nullptr, saveLabel = nullptr, logBtn = nullptr;
     HFONT font = nullptr, fontBig = nullptr;
     int dpi = 96;
     std::vector<std::string> items;
     bool autoName = true, settingText = false, running = false, closing = false, verifying = false;
     nz::VerifyResult vres;
+    bool batch = false;
+    nz::BatchResult bres;
     std::thread worker;
     std::mutex mu;
     nz::Progress prog;
@@ -90,6 +92,7 @@ static void ensureFonts() {
 }
 static const wchar_t* extFor(int fmt) { return fmt == nz::FZIP ? L".zip" : L".7z"; }
 static int curFormat() { return (int)SendMessageW(g.format, CB_GETCURSEL, 0, 0) == 1 ? nz::FZIP : nz::F7Z; }
+static int curMode() { int v = (int)SendMessageW(g.output, CB_GETCURSEL, 0, 0); return v < 0 ? 0 : v; }
 static int curLevel() { int v = (int)SendMessageW(g.level, CB_GETCURSEL, 0, 0); return v < 0 ? 1 : v; }
 
 struct GuiCb : nz::Callbacks {
@@ -353,7 +356,7 @@ static void setArchiveText(const std::string& p) {
     g.settingText = false;
 }
 static void updateAutoName() {
-    if (!g.autoName) return;
+    if (!g.autoName || curMode() != nz::OutSingle) return;
     if (g.items.empty()) { setArchiveText(""); return; }
     std::string ext = U(extFor(curFormat())), first = g.items[0], dir = plat::parentDir(first), base;
     if (g.items.size() == 1) {
@@ -374,7 +377,8 @@ static void updateInfo() {
     else {
         std::string arc = U(getText(g.archive)); uint64_t fr = 0;
         t = std::to_wstring(g.items.size()) + (g.items.size() == 1 ? L" item selected." : L" items selected.");
-        if (!arc.empty() && plat::freeSpace(plat::parentDir(plat::absPath(arc)), fr)) t += L"  Free space on the archive drive: " + W(nz::humanSize(fr)) + L".";
+        std::string where = curMode() == nz::OutSingle ? (arc.empty() ? "" : plat::parentDir(plat::absPath(arc))) : (arc.empty() ? plat::parentDir(g.items[0]) : plat::absPath(arc));
+        if (!where.empty() && plat::freeSpace(where, fr)) t += L"  Free space on the archive drive: " + W(nz::humanSize(fr)) + L".";
     }
     SetWindowTextW(g.info, t.c_str());
 }
@@ -430,6 +434,23 @@ static void pickItems(bool folders) {
     d->Release();
 }
 static void browseArchive() {
+    if (curMode() != nz::OutSingle) {   // several archives: pick the folder they go in
+        IFileOpenDialog* d = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d))) || !d) return;
+        DWORD o = 0; d->GetOptions(&o);
+        d->SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        d->SetTitle(L"Choose the folder for the archives");
+        if (SUCCEEDED(d->Show(g.wnd))) {
+            IShellItem* it = nullptr;
+            if (SUCCEEDED(d->GetResult(&it)) && it) {
+                PWSTR p = nullptr;
+                if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { setArchiveText(U(p)); CoTaskMemFree(p); updateInfo(); }
+                it->Release();
+            }
+        }
+        d->Release();
+        return;
+    }
     wchar_t buf[32768]; buf[0] = 0;
     std::wstring cur = getText(g.archive);
     if (cur.size() < 32000) wcscpy(buf, cur.c_str());
@@ -441,7 +462,18 @@ static void browseArchive() {
     ofn.lpstrTitle = L"Save archive as";
     if (GetSaveFileNameW(&ofn)) { g.autoName = false; setArchiveText(U(buf)); updateInfo(); }
 }
+static void outputChanged() {
+    if (curMode() == nz::OutSingle) {
+        SetWindowTextW(g.saveLabel, L"Save archive as:");
+        g.autoName = true; updateAutoName();
+    } else {
+        SetWindowTextW(g.saveLabel, L"Save the archives in this folder (leave empty to put each one next to its original):");
+        g.autoName = false; setArchiveText("");
+    }
+    updateInfo();
+}
 static void formatChanged() {
+    if (curMode() != nz::OutSingle) return;
     if (g.autoName) { updateAutoName(); return; }
     std::wstring t = getText(g.archive), lower = t;
     CharLowerBuffW(&lower[0], (DWORD)lower.size());
@@ -455,7 +487,7 @@ static void formatChanged() {
 // ---------------------------------------------------------------- running a job
 static void setRunningUI(bool on) {
     g.running = on;
-    HWND inputs[] = {g.list, g.archive, g.format, g.level, g.eat, g.eatLabel, g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.verifyBtn, g.themeBtn};
+    HWND inputs[] = {g.output, g.logBtn, g.archive, g.format, g.level, g.eat, g.eatLabel, g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.verifyBtn, g.themeBtn};
     for (HWND h : inputs) EnableWindow(h, !on);
     ShowWindow(g.start, on ? SW_HIDE : SW_SHOW);
     ShowWindow(g.pause, on ? SW_SHOW : SW_HIDE);
@@ -467,7 +499,7 @@ static void setRunningUI(bool on) {
     EnableWindow(g.pause, TRUE); EnableWindow(g.stop, TRUE);
     SetWindowTextW(g.pause, L"Pause");
     if (on) { SendMessageW(g.bar, PBM_SETPOS, 0, 0); SetWindowTextW(g.st1, L"Preparing…"); SetWindowTextW(g.st2, L""); }
-    else { g.verifying = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); }
+    else { g.verifying = false; g.batch = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); }
 }
 static void startVerify(const std::string& path) {
     if (g.worker.joinable()) g.worker.join();
@@ -505,6 +537,20 @@ static void relaunch() {
         DestroyWindow(g.wnd);
     }
 }
+static void startBatch(const std::vector<nz::BatchJob>& jobs) {
+    if (g.worker.joinable()) g.worker.join();
+    g.stopReq = 0; g.pauseFlag = false; g.haveStart = false;
+    { std::lock_guard<std::mutex> l(g.mu); g.prog = nz::Progress(); g.result = nz::Result(); g.bres = nz::BatchResult(); }
+    setRunningUI(true);
+    g.batch = true;
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    g.worker = std::thread([jobs]() {
+        GuiCb cb;
+        nz::BatchResult b = nz::runBatch(jobs, cb);
+        { std::lock_guard<std::mutex> l(g.mu); g.bres = b; g.result = b.r; }
+        PostMessageW(g.wnd, WM_NZ_DONE, 0, 0);
+    });
+}
 static void startJob(const nz::Options& opt) {
     if (g.worker.joinable()) g.worker.join();
     g.stopReq = 0; g.pauseFlag = false; g.haveStart = false; g.jobArchive = opt.archive;
@@ -538,7 +584,8 @@ static void onProgress() {
     std::wstring s2 = std::wstring(pct);
     if (g.verifying) s2 += L"   •   Read " + W(nz::humanSize(p.doneBytes)) + L" of " + W(nz::humanSize(p.totalBytes));
     else s2 += L"   •   Archive: " + W(nz::humanSize(p.packedBytes)) + L"   •   Originals removed: " + W(nz::humanSize(p.reclaimedBytes)) +
-               L"   •   Files: " + std::to_wstring(p.filesDone) + L" of " + std::to_wstring(p.filesTotal);
+               (p.jobCount > 1 ? L"   •   Archive " + std::to_wstring(p.jobIndex) + L" of " + std::to_wstring(p.jobCount)
+                               : L"   •   Files: " + std::to_wstring(p.filesDone) + L" of " + std::to_wstring(p.filesTotal));
     double el = (double)(now - g.startTick) / 1000.0;
     if (g.haveStart && el > 8 && p.doneBytes > g.startDone && p.totalBytes > p.doneBytes && !g.pauseFlag.load()) {
         double rate = (double)(p.doneBytes - g.startDone) / el;
@@ -551,8 +598,8 @@ static void onProgress() {
 static void onDone() {
     if (g.worker.joinable()) g.worker.join();
     SetThreadExecutionState(ES_CONTINUOUS);
-    nz::Result r; nz::VerifyResult v; bool wasVerify = g.verifying;
-    { std::lock_guard<std::mutex> l(g.mu); r = g.result; v = g.vres; }
+    nz::Result r; nz::VerifyResult v; nz::BatchResult b; bool wasVerify = g.verifying, wasBatch = g.batch;
+    { std::lock_guard<std::mutex> l(g.mu); r = g.result; v = g.vres; b = g.bres; }
     setRunningUI(false);
     if (g.closing) { DestroyWindow(g.wnd); return; }
     if (wasVerify) {
@@ -564,18 +611,26 @@ static void onDone() {
     }
     std::wstring t; UINT icon = MB_ICONINFORMATION;
     std::wstring stats = std::to_wstring(r.final.filesDone) + L" file(s) stored in the archive.\nArchive size: " + W(nz::humanSize(r.final.packedBytes));
+    if (wasBatch) {
+        stats = std::to_wstring(b.done) + L" of " + std::to_wstring(b.total) + L" archives were made";
+        if (b.skipped) stats += L" (" + std::to_wstring(b.skipped) + L" skipped, see notes)";
+        stats += L".\nTotal size of the archives: " + W(nz::humanSize(r.final.packedBytes));
+    }
     if (r.final.reclaimedBytes > 0) {
         stats += L"\nOriginals removed: " + W(nz::humanSize(r.final.reclaimedBytes));
         if (r.final.reclaimedBytes >= r.final.packedBytes) stats += L"\nNet space saved: " + W(nz::humanSize(r.final.reclaimedBytes - r.final.packedBytes));
         else stats += L"\nNet space saved: none (the archive is " + W(nz::humanSize(r.final.packedBytes - r.final.reclaimedBytes)) + L" larger than what was removed)";
     } else if (r.ok) stats += L"\nOriginals were kept.";
     if (r.ok && !r.partial) { t = L"All done.\n\n" + stats; }
+    else if (r.ok && wasBatch) { t = L"Stopped early. Every archive that was made is complete.\n\n" + stats + L"\n\nItems that were not reached are still on disk, untouched. Press Start again to carry on with them."; }
     else if (r.ok) { t = L"The archive was closed early and is complete as it stands.\n\n" + stats + L"\n\nFiles that were not reached are still on disk, untouched."; }
+    else if (r.paused && wasBatch) { t = L"Stopped. Nothing is lost: everything stored so far is safe.\n\nPress Start again with the same items and settings to continue where it left off.\n\n" + stats; }
     else if (r.paused) { t = L"Stopped. Nothing is lost: everything stored so far is safe and the job was saved.\n\nStart NibbleZip again to resume it.\n\n" + stats; }
     else {
         icon = MB_ICONERROR;
         t = L"The job stopped because of a problem:\n\n" + W(r.error);
-        if (r.resumable) t += L"\n\nNothing is lost. The job was saved and can be resumed once the problem is fixed. Start NibbleZip again to resume it.";
+        if (r.resumable && wasBatch) t += L"\n\nNothing is lost. Once the problem is fixed, press Start again with the same items and settings to continue.\n\n" + stats;
+        else if (r.resumable) t += L"\n\nNothing is lost. The job was saved and can be resumed once the problem is fixed. Start NibbleZip again to resume it.";
     }
     if (!r.warnings.empty()) {
         t += L"\n\nNotes:";
@@ -583,7 +638,7 @@ static void onDone() {
         if (r.warnings.size() > 8) t += L"\n…and " + std::to_wstring(r.warnings.size() - 8) + L" more.";
         if (icon == MB_ICONINFORMATION) icon = MB_ICONWARNING;
     }
-    if (r.ok) clearItems();
+    if (r.ok && !(wasBatch && r.partial)) clearItems();
     msg(t, MB_OK | icon);
 }
 static bool offerResume(const nz::JobInfo& ji) {
@@ -595,8 +650,35 @@ static bool offerResume(const nz::JobInfo& ji) {
     if (r == IDNO && !ji.midFile) { nz::Options o = ji.opt; o.finalizeOnly = true; startJob(o); return true; }
     return false;
 }
+static void onStartBatch() {
+    nz::Options base; base.inputs = g.items; base.format = curFormat(); base.level = curLevel();
+    base.eat = SendMessageW(g.eat, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    std::string outDir = U(getText(g.archive));
+    while (!outDir.empty() && (outDir.back() == ' ' || outDir.back() == '\t')) outDir.pop_back();
+    regSet(L"Format", base.format == nz::FZIP ? 1 : 0); regSet(L"Level", (DWORD)base.level);
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    nz::BatchPlan plan = nz::planBatch(base, curMode(), outDir);
+    SetCursor(old);
+    if (!plan.error.empty()) {
+        std::wstring t = W(plan.error);
+        for (auto& n : plan.notes) t += L"\n\u2022 " + W(n);
+        msg(t, MB_OK | MB_ICONWARNING); return;
+    }
+    uint64_t fr = 0; std::string where = outDir.empty() ? plat::parentDir(plan.jobs[0].opt.archive) : plat::absPath(outDir);
+    plat::freeSpace(where, fr);
+    std::wstring t = std::to_wstring(plan.jobs.size()) + L" archive(s) will be made from " + W(nz::humanSize(plan.totalBytes)) + L" of files. Each is named after its original and saved " +
+                     (outDir.empty() ? std::wstring(L"next to it.") : L"in:\n" + W(plat::absPath(outDir))) + L"\n\n";
+    if (base.eat) t += L"Each original is PERMANENTLY DELETED as soon as its own archive has been written to disk, read back and checked. "
+                       L"Deleted originals do not go to the Recycle Bin.\n\nFree space now: " + W(nz::humanSize(fr)) + L".  Largest single item: " + W(nz::humanSize(plan.largestJob)) + L".\n";
+    else t += L"Originals will be kept (normal compression).\n";
+    for (size_t i = 0; i < plan.notes.size() && i < 6; i++) t += L"\n\u2022 " + W(plan.notes[i]);
+    t += L"\n\nContinue?";
+    if (msg(t, MB_OKCANCEL | (base.eat ? MB_ICONWARNING | MB_DEFBUTTON2 : MB_ICONQUESTION)) != IDOK) return;
+    startBatch(plan.jobs);
+}
 static void onStart() {
     if (g.items.empty()) { msg(L"Add at least one file or folder first.", MB_OK | MB_ICONINFORMATION); return; }
+    if (curMode() != nz::OutSingle) { onStartBatch(); return; }
     std::string arc = U(getText(g.archive));
     if (arc.empty()) { msg(L"Choose where to save the archive.", MB_OK | MB_ICONINFORMATION); return; }
     arc = plat::absPath(arc);
@@ -624,10 +706,14 @@ static void onStart() {
 }
 static void onStop() {
     if (g.verifying) { g.stopReq = 1; g.pauseFlag = false; EnableWindow(g.stop, FALSE); return; }
-    int r = msg(L"Stop compressing?\n\n"
-                L"Yes = stop now. Everything stored so far is safe and the job can be resumed later.\n\n"
-                L"No = finish the file in progress, then close the archive. Files not reached stay where they are.\n\n"
-                L"Cancel = keep going.", MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3);
+    int r = msg(g.batch ? L"Stop compressing?\n\n"
+                          L"Yes = stop now. Everything stored so far is safe and you can continue later.\n\n"
+                          L"No = finish the archive in progress, then stop. Items not reached stay where they are.\n\n"
+                          L"Cancel = keep going."
+                        : L"Stop compressing?\n\n"
+                          L"Yes = stop now. Everything stored so far is safe and the job can be resumed later.\n\n"
+                          L"No = finish the file in progress, then close the archive. Files not reached stay where they are.\n\n"
+                          L"Cancel = keep going.", MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3);
     if (!g.running) return;
     if (r == IDYES) { g.stopReq = 1; g.pauseFlag = false; SetWindowTextW(g.st1, L"Stopping safely…"); EnableWindow(g.pause, FALSE); EnableWindow(g.stop, FALSE); }
     else if (r == IDNO) { g.stopReq = 2; g.pauseFlag = false; EnableWindow(g.stop, FALSE); }
@@ -672,7 +758,8 @@ static LRESULT CALLBACK listSub(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, 
 static void createControls() {
     ensureFonts();
     const int M = 20, CW = 640 - 2 * M;
-    HWND title = mk(L"STATIC", L"NibbleZip", 0, 0, M, 14, 280, 30, -1);
+    HWND title = mk(L"STATIC", L"NibbleZip", 0, 0, M, 14, 200, 30, -1);
+    g.logBtn = mk(L"BUTTON", L"Deletion log", WS_TABSTOP, 0, M + CW - 100 - 8 - 150 - 8 - 100, 14, 100, 26, ID_LOG);
     SendMessageW(title, WM_SETFONT, (WPARAM)g.fontBig, TRUE);
     g.verifyBtn = mk(L"BUTTON", L"Check an archive…", WS_TABSTOP, 0, M + CW - 100 - 8 - 150, 14, 150, 26, ID_VERIFY);
     g.themeBtn = mk(L"BUTTON", themeLabel(), WS_TABSTOP, 0, M + CW - 100, 14, 100, 26, ID_THEME);
@@ -700,37 +787,45 @@ static void createControls() {
     g.removeBtn = mk(L"BUTTON", L"Remove", WS_TABSTOP, 0, M + CW - 188, 252, 90, 28, ID_REMOVE);
     g.clearBtn = mk(L"BUTTON", L"Clear", WS_TABSTOP, 0, M + CW - 90, 252, 90, 28, ID_CLEAR);
 
-    mk(L"STATIC", L"Save archive as:", 0, 0, M, 298, 120, 18, -1);
-    g.archive = mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, M, 318, CW - 98, 24, ID_ARCHIVE);
-    g.browse = mk(L"BUTTON", L"Browse…", WS_TABSTOP, 0, M + CW - 90, 316, 90, 28, ID_BROWSE);
+    mk(L"STATIC", L"Create:", 0, 0, M, 300, 60, 18, -1);
+    g.output = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, M + 62, 296, CW - 62, 200, ID_OUTPUT);
+    SendMessageW(g.output, CB_ADDSTRING, 0, (LPARAM)L"One archive containing everything");
+    SendMessageW(g.output, CB_ADDSTRING, 0, (LPARAM)L"A separate archive for each item in the list");
+    SendMessageW(g.output, CB_ADDSTRING, 0, (LPARAM)L"A separate archive for each file (including files inside folders)");
+    SendMessageW(g.output, CB_SETCURSEL, 0, 0);
 
-    mk(L"STATIC", L"Format:", 0, 0, M, 360, 60, 18, -1);
-    g.format = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, M + 62, 356, 220, 200, ID_FORMAT);
+    g.saveLabel = mk(L"STATIC", L"Save archive as:", SS_NOPREFIX, 0, M, 332, CW, 18, -1);
+    g.archive = mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, M, 352, CW - 98, 24, ID_ARCHIVE);
+    g.browse = mk(L"BUTTON", L"Browse…", WS_TABSTOP, 0, M + CW - 90, 350, 90, 28, ID_BROWSE);
+
+    mk(L"STATIC", L"Format:", 0, 0, M, 394, 60, 18, -1);
+    g.format = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, M + 62, 390, 220, 200, ID_FORMAT);
     SendMessageW(g.format, CB_ADDSTRING, 0, (LPARAM)L"7z  –  smallest files");
     SendMessageW(g.format, CB_ADDSTRING, 0, (LPARAM)L"ZIP  –  opens everywhere");
     SendMessageW(g.format, CB_SETCURSEL, regGet(L"Format", 0) == 1 ? 1 : 0, 0);
-    mk(L"STATIC", L"Compression:", 0, 0, M + 310, 360, 84, 18, -1);
-    g.level = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, M + 396, 356, CW - 396, 200, ID_LEVEL);
+    mk(L"STATIC", L"Compression:", 0, 0, M + 310, 394, 84, 18, -1);
+    g.level = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, M + 396, 390, CW - 396, 200, ID_LEVEL);
     const wchar_t* lv[4] = {L"Fast", L"Normal", L"Maximum", L"Ultra (slow, most RAM)"};
     for (auto s : lv) SendMessageW(g.level, CB_ADDSTRING, 0, (LPARAM)s);
     SendMessageW(g.level, CB_SETCURSEL, std::min<DWORD>(3, regGet(L"Level", 1)), 0);
 
     // The tick box and its text are separate controls so the text colour follows the theme.
-    g.eat = mk(L"BUTTON", L"", BS_AUTOCHECKBOX | WS_TABSTOP, 0, M, 397, 18, 18, ID_EAT);
-    g.eatLabel = mk(L"STATIC", L"Delete each original once it is safely stored and verified (frees space while compressing)", SS_NOTIFY | SS_NOPREFIX, 0, M + 22, 398, CW - 22, 20, ID_EATLABEL);
+    g.eat = mk(L"BUTTON", L"", BS_AUTOCHECKBOX | WS_TABSTOP, 0, M, 431, 18, 18, ID_EAT);
+    g.eatLabel = mk(L"STATIC", L"Delete each original once it is safely stored and verified (frees space while compressing)", SS_NOTIFY | SS_NOPREFIX, 0, M + 22, 432, CW - 22, 20, ID_EATLABEL);
     SendMessageW(g.eat, BM_SETCHECK, BST_CHECKED, 0);
 
-    g.info = mk(L"STATIC", L"", SS_NOPREFIX, 0, M, 432, CW, 54, -1);
-    g.st1 = mk(L"STATIC", L"", SS_NOPREFIX | SS_PATHELLIPSIS, 0, M, 428, CW, 18, -1);
-    g.bar = mk(PROGRESS_CLASSW, L"", PBS_SMOOTH, 0, M, 450, CW, 18, -1);
+    g.info = mk(L"STATIC", L"", SS_NOPREFIX, 0, M, 466, CW, 54, -1);
+    g.st1 = mk(L"STATIC", L"", SS_NOPREFIX | SS_PATHELLIPSIS, 0, M, 462, CW, 18, -1);
+    g.bar = mk(PROGRESS_CLASSW, L"", PBS_SMOOTH, 0, M, 484, CW, 18, -1);
     SendMessageW(g.bar, PBM_SETRANGE32, 0, 1000);
-    g.st2 = mk(L"STATIC", L"", SS_NOPREFIX, 0, M, 474, CW, 34, -1);
+    g.st2 = mk(L"STATIC", L"", SS_NOPREFIX, 0, M, 508, CW, 34, -1);
 
-    g.menuBtn = mk(L"BUTTON", L"", WS_TABSTOP, 0, M, 520, 200, 30, ID_MENU);
-    g.start = mk(L"BUTTON", L"Start", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, M + CW - 130, 520, 130, 30, ID_START);
-    g.pause = mk(L"BUTTON", L"Pause", WS_TABSTOP, 0, M + CW - 268, 520, 130, 30, ID_PAUSE);
-    g.stop = mk(L"BUTTON", L"Stop…", WS_TABSTOP, 0, M + CW - 130, 520, 130, 30, ID_STOP);
+    g.menuBtn = mk(L"BUTTON", L"", WS_TABSTOP, 0, M, 554, 200, 30, ID_MENU);
+    g.start = mk(L"BUTTON", L"Start", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, M + CW - 130, 554, 130, 30, ID_START);
+    g.pause = mk(L"BUTTON", L"Pause", WS_TABSTOP, 0, M + CW - 268, 554, 130, 30, ID_PAUSE);
+    g.stop = mk(L"BUTTON", L"Stop…", WS_TABSTOP, 0, M + CW - 130, 554, 130, 30, ID_STOP);
     if (T.dark) {
+        darken(g.output, L"DarkMode_CFD"); darken(g.logBtn, L"DarkMode_Explorer");
         HWND btns[] = {g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.start, g.pause, g.stop, g.verifyBtn, g.themeBtn, g.eat};
         for (HWND b : btns) darken(b, L"DarkMode_Explorer");
         darken(g.format, L"DarkMode_CFD"); darken(g.level, L"DarkMode_CFD"); darken(g.archive, L"DarkMode_CFD");
@@ -746,8 +841,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_COMMAND: {
         int id = LOWORD(wp), code = HIWORD(wp);
-        if (id == ID_ARCHIVE && code == EN_CHANGE) { if (!g.settingText) { g.autoName = false; updateInfo(); } return 0; }
+        if (id == ID_ARCHIVE && code == EN_CHANGE) { if (!g.settingText) { if (curMode() == nz::OutSingle) g.autoName = false; updateInfo(); } return 0; }
         if (id == ID_FORMAT && code == CBN_SELCHANGE) { formatChanged(); return 0; }
+        if (id == ID_OUTPUT && code == CBN_SELCHANGE) { outputChanged(); return 0; }
         if (id == ID_EATLABEL && code == STN_CLICKED) {
             if (!g.running) SendMessageW(g.eat, BM_SETCHECK, SendMessageW(g.eat, BM_GETCHECK, 0, 0) == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED, 0);
             return 0;
@@ -761,6 +857,12 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         case ID_BROWSE: browseArchive(); return 0;
         case ID_START: onStart(); return 0;
         case ID_VERIFY: pickVerify(); return 0;
+        case ID_LOG: {
+            std::string lp = nz::deletionLogPath(); plat::Stat st;
+            if (!plat::stat(lp, st)) msg(L"Nothing has been deleted yet, so there is no log.\n\nOnce NibbleZip removes an original, it is listed here with the date, its size and the archive it went into.", MB_OK | MB_ICONINFORMATION);
+            else ShellExecuteW(g.wnd, L"open", L"notepad.exe", (L"\"" + W(lp) + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+            return 0;
+        }
         case ID_THEME:
             T.pref = (T.pref + 1) % 3; regSet(L"Theme", (DWORD)T.pref);
             relaunch();   // the theme is applied when the window is built
@@ -897,7 +999,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     RegisterClassExW(&wc);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r = {0, 0, S(640), S(570)};
+    RECT r = {0, 0, S(640), S(604)};
     AdjustWindowRectEx(&r, style, FALSE, WS_EX_ACCEPTFILES);
     g.wnd = CreateWindowExW(WS_EX_ACCEPTFILES, kClass, kTitle, style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     if (!g.wnd) return 1;

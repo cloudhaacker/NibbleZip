@@ -654,11 +654,28 @@ static void restoreIndex(Ctx& c) {
     c.res.error = keepErr; c.res.resumable = keepRes;
 }
 
+// Appends a line to the deletion log for every original that is removed.
+static void logDeleted(Ctx& c, const std::string& path, uint64_t size) {
+    static bool dirMade = false;
+    if (!dirMade) { dirMade = true; plat::makeDirs(plat::appDataDir()); }
+    plat::File lf; uint64_t pos = 0;
+    if (!lf.open(deletionLogPath(), plat::OpenRWAlways) || !lf.size(pos)) return;
+    time_t now = time(nullptr); struct tm lt; char ts[32] = "";
+#ifdef _WIN32
+    if (localtime_s(&lt, &now) == 0)
+#else
+    if (localtime_r(&now, &lt))
+#endif
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &lt);
+    std::string line = std::string(ts) + "\tdeleted\t" + path + "\t" + std::to_string(size) + " bytes\tstored in\t" + c.archive + "\r\n";
+    lf.writeAt(pos, line.data(), line.size());
+}
+
 static void deleteSource(Ctx& c, const Entry& e) {
     plat::Stat s;
     if (!plat::stat(e.src, s)) return;
     if (s.size != e.size || (!e.z64 && s.mtime != e.mtime)) { c.warn("Changed after it was archived, so it was kept: " + e.src); return; }
-    if (plat::removeFile(e.src)) c.pr.reclaimedBytes += e.size;
+    if (plat::removeFile(e.src)) { c.pr.reclaimedBytes += e.size; logDeleted(c, e.src, e.size); }
     else c.warn("Archived but could not be deleted (" + plat::lastError() + "): " + e.src);
 }
 
@@ -849,7 +866,7 @@ static bool processLarge(Ctx& c, const PlanFile& f, bool resuming) {
             c.pr.filesDone++;
             if (c.opt.eat) {
                 uint64_t before = c.pr.reclaimedBytes;
-                if (plat::removeFile(e.src)) c.pr.reclaimedBytes = before + (punch ? size - prev : size);
+                if (plat::removeFile(e.src)) { c.pr.reclaimedBytes = before + (punch ? size - prev : size); logDeleted(c, e.src, size); }
                 else c.warn("Archived but could not be deleted (" + plat::lastError() + "): " + e.src);
             }
             CP("part-deleted");
@@ -880,6 +897,12 @@ static bool openArchiveNew(Ctx& c) {
 
 // ---------------------------------------------------------------- public API
 std::string journalPathFor(const std::string& archive) { return archive + ".nzj"; }
+void discardStaleJournal(const std::string& archive0) {
+    std::string archive = plat::absPath(archive0); plat::Stat st;
+    if (plat::stat(archive, st)) return;
+    plat::removeFile(journalPathFor(archive)); plat::removeFile(mirrorPathFor(archive));
+}
+std::string deletionLogPath() { return plat::join(plat::appDataDir(), "deleted-files.log"); }
 
 std::string humanSize(uint64_t n) {
     const char* u[] = {"bytes", "KB", "MB", "GB", "TB"};
@@ -968,7 +991,8 @@ std::vector<JobInfo> pendingJobs() {
 
 Result run(const Options& opt0, Callbacks& cb) {
     crcInit();
-    if (const char* e = getenv("NIBBLEZIP_CRASH_AT")) { g_cpN = atoi(e); g_cpCount = 0; }
+    static bool cpInit = false;
+    if (!cpInit) { cpInit = true; if (const char* e = getenv("NIBBLEZIP_CRASH_AT")) { g_cpN = atoi(e); g_cpCount = 0; } }
     Ctx c; c.opt = opt0; c.cb = &cb;
     c.archive = plat::absPath(opt0.archive); c.arcDir = plat::parentDir(c.archive);
     c.lastTick = std::chrono::steady_clock::now();
@@ -981,6 +1005,8 @@ Result run(const Options& opt0, Callbacks& cb) {
         if (!plat::stat(c.archive, as)) {   // journal left over from an archive that no longer exists
             plat::removeFile(journalPathFor(c.archive)); plat::removeFile(mirrorPathFor(c.archive));
             resume = false; loaded = State();
+            // Nothing had been written yet: start that job over with the settings it was given.
+            if (c.opt.inputs.empty()) { c.opt.inputs = jh.inputs; c.opt.format = jh.format; c.opt.level = jh.level; c.opt.eat = jh.eat; c.opt.finalizeOnly = false; }
         }
     }
     if (resume) {
@@ -994,11 +1020,14 @@ Result run(const Options& opt0, Callbacks& cb) {
         if (c.opt.finalizeOnly) { c.fail("No unfinished job found for this archive.", false); return finish(); }
         Preflight pf = preflight(c.opt);
         if (!pf.ok) { c.fail(pf.error, false); return finish(); }
-        if (!openArchiveNew(c)) return finish();
+        // The journal is created before the archive, so a crash in between never leaves an archive without one.
         Buf h; h.u8(R_HEADER); h.u32(JMAGIC); h.u8((uint8_t)c.opt.format); h.u8((uint8_t)c.opt.level); h.u8(c.opt.eat ? 1 : 0); h.str(c.archive);
         h.u32((uint32_t)c.opt.inputs.size());
         for (auto& in : c.opt.inputs) h.str(plat::absPath(in));
-        if (!c.j.start(c.archive, std::vector<uint8_t>()) || !c.j.append(h)) { c.fail("Cannot create the journal: " + plat::lastError(), false); c.arc.close(); plat::removeFile(c.archive); c.j.destroy(); return finish(); }
+        if (!c.j.start(c.archive, std::vector<uint8_t>()) || !c.j.append(h)) { c.fail("Cannot create the journal: " + plat::lastError(), false); c.j.destroy(); return finish(); }
+        CP("journal-created");
+        if (!openArchiveNew(c)) { c.j.destroy(); return finish(); }
+        CP("archive-created");
         for (auto& in : c.opt.inputs) in = plat::absPath(in);
     }
     for (auto& e : c.st.entries) c.idxEst += e.rel.size() * 2 + 64;
@@ -1095,7 +1124,7 @@ Result run(const Options& opt0, Callbacks& cb) {
     if (c.opt.eat) {
         for (auto& e : c.st.empties) if (!e.isDir) {
             plat::Stat s;
-            if (plat::stat(e.src, s) && s.size == 0 && !plat::removeFile(e.src)) c.warn("Could not delete empty file: " + e.src);
+            if (plat::stat(e.src, s) && s.size == 0) { if (plat::removeFile(e.src)) logDeleted(c, e.src, 0); else c.warn("Could not delete empty file: " + e.src); }
         }
         CP("final-empties-deleted");
         for (size_t k = c.st.empties.size(); k-- > 0;) if (c.st.empties[k].isDir) plat::removeDir(c.st.empties[k].src);

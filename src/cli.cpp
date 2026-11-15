@@ -25,6 +25,7 @@ static int usage() {
     fprintf(stderr,
         "NibbleZip - compress and reclaim space as it goes\n"
         "  nibblezip-cli pack [-f 7z|zip] [-l 0..3] [--keep] -o ARCHIVE INPUT...\n"
+        "  nibblezip-cli pack --each item|file [--outdir DIR] [-f 7z|zip] [-l 0..3] [--keep] INPUT...\n"
         "  nibblezip-cli check [-f 7z|zip] [-l 0..3] [--keep] -o ARCHIVE INPUT...\n"
         "  nibblezip-cli resume ARCHIVE [--finalize]\n"
         "  nibblezip-cli verify ARCHIVE\n"
@@ -53,7 +54,7 @@ int main(int argc, char** argv) {
 #endif
     if (argc < 2) return usage();
     std::string cmd = argv[1];
-    nz::Options o; CliCb cb;
+    nz::Options o; CliCb cb; int each = nz::OutSingle; std::string outDir;
     if (cmd == "pending") {
         for (auto& j : nz::pendingJobs()) printf("%s  (%llu files done%s)\n", j.archive.c_str(), (unsigned long long)j.filesDone, j.midFile ? ", mid-file" : "");
         return 0;
@@ -64,6 +65,8 @@ int main(int argc, char** argv) {
         else if (a == "-l" && i + 1 < argc) o.level = atoi(argv[++i]);
         else if (a == "-o" && i + 1 < argc) o.archive = argv[++i];
         else if (a == "--keep") o.eat = false;
+        else if (a == "--each" && i + 1 < argc) each = !strcmp(argv[++i], "file") ? nz::OutPerFile : nz::OutPerItem;
+        else if (a == "--outdir" && i + 1 < argc) outDir = argv[++i];
         else if (a == "--finalize") o.finalizeOnly = true;
         else if (a == "--quiet") cb.quiet = true;
         else if (a == "--step" && i + 1 < argc) o.testStep = strtoull(argv[++i], nullptr, 10);
@@ -71,6 +74,18 @@ int main(int argc, char** argv) {
         else if (a == "--finish-after" && i + 1 < argc) cb.finishAfter = strtoull(argv[++i], nullptr, 10);
         else if ((cmd == "resume" || cmd == "verify") && o.archive.empty()) o.archive = a;
         else o.inputs.push_back(a);
+    }
+    if (cmd == "pack" && each != nz::OutSingle) {
+        nz::BatchPlan plan = nz::planBatch(o, each, outDir);
+        for (auto& n : plan.notes) fprintf(stderr, "note: %s\n", n.c_str());
+        if (!plan.error.empty()) { fprintf(stderr, "Cannot start: %s\n", plan.error.c_str()); return 1; }
+        nz::BatchResult b = nz::runBatch(plan.jobs, cb);
+        if (!cb.quiet) fprintf(stderr, "\n");
+        for (auto& w : b.r.warnings) fprintf(stderr, "warning: %s\n", w.c_str());
+        fprintf(stderr, "%llu of %llu archives made, %llu skipped\n", (unsigned long long)b.done, (unsigned long long)b.total, (unsigned long long)b.skipped);
+        if (b.r.paused) { fprintf(stderr, "Paused. Run the same command again to continue.\n"); return 3; }
+        if (!b.r.ok) { fprintf(stderr, "Error: %s\n", b.r.error.c_str()); return 1; }
+        return 0;
     }
     if (o.archive.empty()) return usage();
     if (cmd == "verify") {

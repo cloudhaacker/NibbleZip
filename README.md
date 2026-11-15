@@ -23,6 +23,15 @@ damage arising from its use. Keep a backup of anything you cannot afford to lose
 **Check an archive** re-reads a finished 7z or ZIP from disk, decompresses every file and compares
 it with its stored checksum. **Theme** switches between following Windows, light and dark.
 
+**Create** chooses between one archive containing everything, a separate archive for each item
+in the list, or a separate archive for each file (including files inside folders, for example a
+ROM folder where every game becomes its own zip). Separate archives are named after their
+originals and go next to them, or into a folder you pick. Items whose archive already exists are
+left alone, so pressing Start again after a stop simply carries on.
+
+**Deletion log** opens a plain text list of every original NibbleZip has removed, with the date,
+size and the archive it went into (`%LOCALAPPDATA%\NibbleZip\deleted-files.log`).
+
 The format and compression level you last used are remembered. At the end of a job the app
 reports the archive size, how much of the originals it removed, and the net space saved.
 
