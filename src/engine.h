@@ -38,6 +38,7 @@ struct Preflight {
     std::string error;
     std::vector<std::string> notes;
     uint64_t totalBytes = 0, files = 0, dirs = 0, freeBytes = 0, needBytes = 0, stepBytes = 0, largest = 0;
+    uint64_t estBytes = 0;   // rough estimate of the finished archive size, from samples (0 = not estimated)
     bool sameVolume = true, holes = true;
 };
 
@@ -46,6 +47,7 @@ struct Result {
     bool paused = false;    // stopped on request; resumable
     bool resumable = false; // an error happened but the job can be resumed
     bool partial = false;   // closed early on request; remaining sources untouched
+    bool archiveRemoved = false;   // undo only: the archive held nothing else, so it was removed
     std::string error;
     std::vector<std::string> warnings;
     Progress final;
@@ -85,6 +87,11 @@ Preflight preflight(const Options& opt);
 // Reads a finished 7z or ZIP archive from disk, decompresses every file and checks it against its stored checksum.
 VerifyResult verifyArchive(const std::string& archive, Callbacks& cb);
 Result run(const Options& opt, Callbacks& cb);
+// For a job stopped part-way through a large file: puts that file back exactly as it was, then closes the archive
+// with whatever else it already holds (or removes it if it holds nothing).
+Result undoPartial(const std::string& archive, Callbacks& cb);
+// Rough estimate of the archive size for these inputs, by compressing samples. Returns 0 if it cannot tell.
+uint64_t estimateArchiveSize(const std::vector<std::string>& inputs, int format, int level, uint64_t& totalBytes);
 bool loadJob(const std::string& archive, JobInfo& info);
 std::vector<JobInfo> pendingJobs();
 std::string journalPathFor(const std::string& archive);

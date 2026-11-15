@@ -44,6 +44,7 @@ bool stat(const std::string& path, Stat& st);
 bool listDir(const std::string& path, std::vector<DirEnt>& out);
 bool removeFile(const std::string& path);
 bool removeDir(const std::string& path);
+bool setMTime(const std::string& path, uint64_t mtime);   // FILETIME units
 bool makeDirs(const std::string& path);
 bool freeSpace(const std::string& dir, uint64_t& freeBytes);
 std::string volumeId(const std::string& path);

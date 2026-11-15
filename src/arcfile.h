@@ -21,6 +21,7 @@ public:
     bool size(uint64_t& sz) { sz = total_; return open_; }
 
     static std::string partName(const std::string& base, uint64_t index);   // index 0 -> ".001"
+    static void removeAll(const std::string& base, uint64_t partSize);      // deletes the archive file or all its parts
     static bool exists(const std::string& base);                             // as one file or as parts
     // If `path` is the first part of a split archive, returns its base name and part size.
     static void detect(const std::string& path, std::string& base, uint64_t& partSize);

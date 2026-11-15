@@ -73,9 +73,10 @@ int main(int argc, char** argv) {
         else if (a == "--step" && i + 1 < argc) o.testStep = strtoull(argv[++i], nullptr, 10);
         else if (a == "--pause-after" && i + 1 < argc) cb.pauseAfter = strtoull(argv[++i], nullptr, 10);
         else if (a == "--finish-after" && i + 1 < argc) cb.finishAfter = strtoull(argv[++i], nullptr, 10);
-        else if ((cmd == "resume" || cmd == "verify") && o.archive.empty()) o.archive = a;
+        else if ((cmd == "resume" || cmd == "verify" || cmd == "undo") && o.archive.empty()) o.archive = a;
         else o.inputs.push_back(a);
     }
+    if (cmd == "estimate") o.archive = "-";
     if (cmd == "pack" && each != nz::OutSingle) {
         nz::BatchPlan plan = nz::planBatch(o, each, outDir);
         for (auto& n : plan.notes) fprintf(stderr, "note: %s\n", n.c_str());
@@ -89,6 +90,17 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (o.archive.empty()) return usage();
+    if (cmd == "undo") {
+        nz::Result u = nz::undoPartial(o.archive, cb);
+        if (!cb.quiet) fprintf(stderr, "\n");
+        if (u.ok) { fprintf(stderr, "The file was put back. %s\n", u.archiveRemoved ? "The archive held nothing else and was removed." : "The archive was closed with what it already held."); return 0; }
+        if (u.paused) { fprintf(stderr, "Paused.\n"); return 3; }
+        fprintf(stderr, "Error: %s\n", u.error.c_str()); return 1;
+    }
+    if (cmd == "estimate") {
+        uint64_t total = 0, est = nz::estimateArchiveSize(o.inputs, o.format, o.level, total);
+        printf("%llu %llu\n", (unsigned long long)total, (unsigned long long)est); return 0;
+    }
     if (cmd == "verify") {
         nz::VerifyResult v = nz::verifyArchive(o.archive, cb);
         if (!cb.quiet) fprintf(stderr, "\n");

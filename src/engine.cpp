@@ -61,7 +61,10 @@ struct Entry {
 };
 struct Folder { uint64_t packSize = 0; uint8_t prop = 0; size_t first = 0, count = 0; };
 struct PartState { bool active = false; Entry e; uint64_t offset = 0; uint32_t crcState = 0; uint64_t packStart = 0; uint8_t prop = 0; };
+// One committed step of a large file, kept so the steps can be undone in reverse order.
+struct PartStep { uint64_t endBefore = 0, endAfter = 0, offBefore = 0, offAfter = 0, csizeBefore = 0; uint32_t crcBefore = 0; };
 struct State {
+    std::vector<PartStep> partSteps;
     std::vector<Entry> entries;
     std::vector<Folder> folders;
     std::vector<Entry> empties;
@@ -71,7 +74,7 @@ struct State {
 struct JHeader { int format = 0, level = 1; bool eat = true; std::string archive; std::vector<std::string> inputs; uint64_t split = 0; };
 
 const uint32_t JMAGIC = 0x314A5A4E; // "NZJ1"
-enum { R_HEADER = 1, R_BATCH = 2, R_PART = 3, R_EMPTY = 4 };
+enum { R_HEADER = 1, R_BATCH = 2, R_PART = 3, R_EMPTY = 4, R_UNPART = 5 };
 
 static void putEntry(Buf& b, const Entry& e) {
     b.str(e.src); b.str(e.rel); b.u64(e.size); b.u64(e.mtime); b.u32(e.attr); b.u32(e.crc);
@@ -117,8 +120,13 @@ static size_t parseJournal(const std::vector<uint8_t>& b, JHeader& h, State& st)
             uint64_t dataEnd = r.u64(); Entry e = getEntry(r);
             uint64_t off = r.u64(); uint32_t crcState = r.u32(); uint64_t packStart = r.u64(); uint8_t prop = r.u8();
             if (r.bad) break;
+            PartStep ps; ps.endBefore = st.dataEnd; ps.endAfter = dataEnd; ps.offAfter = off;
+            if (st.part.active) { ps.offBefore = st.part.offset; ps.csizeBefore = st.part.e.csize; ps.crcBefore = st.part.crcState; }
+            else { ps.offBefore = 0; ps.csizeBefore = 0; ps.crcBefore = CRC_INIT_VAL; st.partSteps.clear(); }
+            st.partSteps.push_back(ps);
             st.dataEnd = dataEnd;
             if (off >= e.size) {
+                st.partSteps.clear();
                 e.crc = CRC_GET_DIGEST(crcState);
                 Folder f; f.packSize = dataEnd - packStart; f.prop = prop; f.first = st.entries.size(); f.count = 1;
                 st.entries.push_back(std::move(e)); st.folders.push_back(f);
@@ -127,6 +135,12 @@ static size_t parseJournal(const std::vector<uint8_t>& b, JHeader& h, State& st)
                 st.part.active = true; st.part.e = std::move(e); st.part.offset = off; st.part.crcState = crcState;
                 st.part.packStart = packStart; st.part.prop = prop;
             }
+        } else if (type == R_UNPART) {
+            // One step of the half-processed file was put back into its original.
+            if (!st.part.active || st.partSteps.empty()) break;
+            PartStep ps = st.partSteps.back(); st.partSteps.pop_back();
+            st.dataEnd = ps.endBefore; st.part.offset = ps.offBefore; st.part.crcState = ps.crcBefore; st.part.e.csize = ps.csizeBefore;
+            if (st.partSteps.empty()) st.part = PartState();
         } else if (type == R_EMPTY) {
             uint32_t n = r.u32();
             std::vector<Entry> es;
@@ -425,6 +439,38 @@ static bool storeLzma2(const uint8_t* in, size_t n, bool final, std::vector<uint
     }
     if (final) out.push_back(0);
     return true;
+}
+
+// Decompresses one LZMA2 run (as written by one step) into dst; must produce exactly n bytes.
+static bool lzmaDecodeRun(const uint8_t* packed, size_t pn, uint8_t prop, uint8_t* dst, size_t n) {
+    CLzma2Dec d; Lzma2Dec_CONSTRUCT(&d);
+    if (Lzma2Dec_Allocate(&d, prop, &g_Alloc) != SZ_OK) return false;
+    Lzma2Dec_Init(&d);
+    size_t sp = 0, dp = 0; bool ok = false;
+    for (;;) {
+        SizeT dl = n - dp, sl = pn - sp; ELzmaStatus status = LZMA_STATUS_NOT_SPECIFIED;
+        SRes r = Lzma2Dec_DecodeToBuf(&d, dst + dp, &dl, packed + sp, &sl, LZMA_FINISH_ANY, &status);
+        if (r != SZ_OK) break;
+        dp += dl; sp += sl;
+        if (dp == n && sp == pn) { ok = true; break; }
+        if (dl == 0 && sl == 0) break;
+    }
+    Lzma2Dec_Free(&d, &g_Alloc);
+    return ok;
+}
+static bool inflateRun(const uint8_t* packed, size_t pn, uint8_t* dst, size_t n) {
+    z_stream s; memset(&s, 0, sizeof(s));
+    if (inflateInit2(&s, -15) != Z_OK) return false;
+    s.next_in = (Bytef*)packed; s.avail_in = (uInt)pn; s.next_out = dst; s.avail_out = (uInt)n;
+    int r = inflate(&s, Z_SYNC_FLUSH);
+    bool ok = (r == Z_OK || r == Z_STREAM_END || r == Z_BUF_ERROR) && s.avail_out == 0;
+    if (ok && s.avail_in > 0) {   // the step ends with an empty flush block that produces no data
+        uint8_t scratch[16]; s.next_out = scratch; s.avail_out = sizeof(scratch);
+        r = inflate(&s, Z_SYNC_FLUSH);
+        ok = (r == Z_OK || r == Z_STREAM_END || r == Z_BUF_ERROR) && s.avail_out == sizeof(scratch) && s.avail_in == 0;
+    }
+    inflateEnd(&s);
+    return ok;
 }
 
 struct ZJob { const uint8_t* in = nullptr; size_t n = 0; int flush = Z_FINISH; std::vector<uint8_t> out; bool ok = false; };
@@ -997,6 +1043,141 @@ std::vector<JobInfo> pendingJobs() {
         if (loadJob(h.archive, ji)) out.push_back(ji);
     }
     return out;
+}
+
+uint64_t estimateArchiveSize(const std::vector<std::string>& inputs, int format, int level, uint64_t& totalBytes) {
+    crcInit();
+    totalBytes = 0;
+    Plan plan; std::string err;
+    if (!scan(inputs, "", plan, err, true)) return 0;
+    totalBytes = plan.total;
+    if (plan.total == 0) return 0;
+    const size_t piece = 1 << 20;
+    size_t K = (size_t)std::min<uint64_t>(24, (plan.total + piece - 1) / piece);
+    int lv = std::min(3, std::max(0, level));
+    static const int zLevels[4] = {3, 6, 9, 9};
+    std::vector<uint8_t> buf(piece), out;
+    uint64_t in = 0, packed = 0, cum = 0; size_t fi = 0;
+    for (size_t k = 0; k < K; k++) {
+        uint64_t target = plan.total / K * k;                     // position in all the data laid end to end
+        while (fi < plan.files.size() && cum + plan.files[fi].size <= target) { cum += plan.files[fi].size; fi++; }
+        if (fi >= plan.files.size()) break;
+        const PlanFile& f = plan.files[fi];
+        uint64_t off = target - cum; size_t want = (size_t)std::min<uint64_t>(piece, f.size - off), got = 0;
+        plat::File fh;
+        if (!fh.open(f.src, plat::OpenRead) || !fh.readAt(off, buf.data(), want, got) || got == 0) continue;
+        size_t n = got, o = n;
+        if (sampleRatio(buf.data(), n) <= kStoreRatio) {
+            if (format == F7Z) {
+                CLzma2EncHandle h = Lzma2Enc_Create(&g_Alloc, &g_BigAlloc);
+                if (h) {
+                    CLzma2EncProps p; Lzma2EncProps_Init(&p);
+                    p.lzmaProps.level = lv == 0 ? 1 : 3; p.lzmaProps.dictSize = 1 << 20; p.lzmaProps.reduceSize = n; p.numTotalThreads = 1; p.numBlockThreads_Max = 1;
+                    out.clear(); OutVec ov; ov.vt.Write = outWrite; ov.v = &out;
+                    if (Lzma2Enc_SetProps(h, &p) == SZ_OK && Lzma2Enc_Encode2(h, &ov.vt, nullptr, nullptr, nullptr, buf.data(), n, nullptr) == SZ_OK) o = std::min(n, out.size());
+                    Lzma2Enc_Destroy(h);
+                }
+            } else {
+                ZJob j; j.in = buf.data(); j.n = n; j.flush = Z_FINISH; deflateOne(j, zLevels[lv]);
+                if (j.ok) o = std::min(n, j.out.size());
+            }
+        }
+        in += n; packed += o;
+    }
+    if (in == 0) return 0;
+    double ratio = (double)packed / (double)in;
+    return (uint64_t)((double)plan.total * ratio) + plan.files.size() * 64 + 1024;
+}
+
+Result undoPartial(const std::string& archive0, Callbacks& cb) {
+    crcInit();
+    static bool cpInit = false;
+    if (!cpInit) { cpInit = true; if (const char* e = getenv("NIBBLEZIP_CRASH_AT")) { g_cpN = atoi(e); g_cpCount = 0; } }
+    Ctx c; c.cb = &cb;
+    c.archive = plat::absPath(archive0); c.arcDir = plat::parentDir(c.archive);
+    c.lastTick = std::chrono::steady_clock::now();
+    auto finish = [&]() -> Result { c.res.final = c.pr; c.cb->progress(c.pr); return c.res; };
+    JHeader jh; std::vector<uint8_t> jbytes;
+    if (!loadJournal(c.archive, jh, c.st, jbytes)) { c.fail("No unfinished job was found for this archive.", false); return finish(); }
+    if (!c.st.part.active || c.st.partSteps.empty()) { c.fail("No file is half-processed in this job, so there is nothing to put back.", false); return finish(); }
+    c.opt.archive = c.archive; c.opt.format = jh.format; c.opt.level = jh.level; c.opt.eat = jh.eat; c.opt.inputs = jh.inputs; c.opt.split = jh.split;
+    if (!c.arc.openExisting(c.archive, c.opt.split, false)) { c.fail("Cannot open archive " + c.archive + ": " + plat::lastError()); return finish(); }
+    uint64_t asz = 0; c.arc.size(asz);
+    if (asz < c.st.dataEnd) { c.fail("The archive is shorter than its journal says. Nothing was changed.", false); return finish(); }
+    const Entry e = c.st.part.e;
+    plat::File src; uint64_t ssz = 0;
+    if (!src.open(e.src, plat::OpenReadPunch) || !src.size(ssz)) { c.fail("Cannot open the original for writing: " + e.src + " (" + plat::lastError() + ")"); return finish(); }
+    if (ssz != e.size) { c.fail("The original has changed size, so it cannot be put back safely: " + e.src, false); return finish(); }
+    if (!c.j.start(c.archive, jbytes)) { c.fail("Cannot open the journal: " + plat::lastError()); return finish(); }
+    size_t lfhLen = 0;
+    if (c.opt.format == FZIP) { Buf h; zipLFH(h, e); lfhLen = h.b.size(); }
+    const std::vector<PartStep> steps = c.st.partSteps;
+    c.pr.totalBytes = 2 * c.st.part.offset; c.pr.filesTotal = 1; c.pr.current = e.rel;
+    // Decompresses step k into c.buf.
+    auto decode = [&](size_t k) -> bool {
+        const PartStep& ps = steps[k];
+        size_t pn = (size_t)(ps.endAfter - ps.endBefore), n = (size_t)(ps.offAfter - ps.offBefore), got = 0;
+        try { c.out.resize(pn); c.buf.resize(n); } catch (...) { return c.fail("Out of memory"); }
+        if (!c.arc.readAt(ps.endBefore, c.out.data(), pn, got) || got != pn) return c.fail("Could not read the archive: " + plat::lastError());
+        size_t skip = (c.opt.format == FZIP && k == 0) ? lfhLen : 0;
+        if (skip > pn) return c.fail("The archive data for this file is not as expected.");
+        bool ok;
+        if (c.opt.format == F7Z) ok = lzmaDecodeRun(c.out.data(), pn, c.st.part.prop, c.buf.data(), n);
+        else if (e.method == 0) { ok = pn - skip == n; if (ok) memcpy(c.buf.data(), c.out.data() + skip, n); }
+        else ok = inflateRun(c.out.data() + skip, pn - skip, c.buf.data(), n);
+        if (!ok) return c.fail("The stored part of this file could not be read back correctly. Nothing more was changed; resume the job instead.");
+        return true;
+    };
+    // Pass 1: prove the stored part is intact before touching anything.
+    uint32_t crc = CRC_INIT_VAL;
+    for (size_t k = 0; k < steps.size(); k++) {
+        pollStop(c);
+        if (c.stop == 1) { c.res.paused = true; c.res.resumable = true; return finish(); }
+        if (!decode(k)) return finish();
+        crc = CrcUpdate(crc, c.buf.data(), c.buf.size());
+        c.pr.doneBytes += c.buf.size(); tick(c, false);
+    }
+    if (crc != c.st.part.crcState) { c.fail("The stored part of this file did not pass its check, so nothing was changed. Resume the job instead."); return finish(); }
+    // Pass 2: put the steps back, last one first, shrinking the archive as we go.
+    bool holes = plat::supportsHoles(e.src);
+    for (size_t k = steps.size(); k-- > 0;) {
+        const PartStep& ps = steps[k];
+        if (!decode(k)) return finish();
+        size_t n = c.buf.size(), got = 0; uint64_t fr = 0;
+        if (holes && plat::freeSpace(plat::parentDir(e.src), fr) && fr < n + (8ull << 20)) {
+            c.fail("Not enough free space to put the next piece back (" + humanSize(n) + " needed, " + humanSize(fr) + " free). Free some space and try again."); return finish();
+        }
+        uint32_t want = CrcCalc(c.buf.data(), n);
+        if (!src.writeAt(ps.offBefore, c.buf.data(), n) || !src.flush()) { c.fail("Writing to the original failed: " + plat::lastError()); return finish(); }
+        if (!src.readAt(ps.offBefore, c.buf.data(), n, got) || got != n || CrcCalc(c.buf.data(), n) != want) { c.fail("The original did not read back correctly after writing. The archive was left as it is."); return finish(); }
+        CP("undo-written");
+        Buf rec; rec.u8(R_UNPART);
+        if (!c.j.append(rec)) { c.fail("Could not write the journal: " + plat::lastError()); return finish(); }
+        CP("undo-journaled");
+        c.st.dataEnd = ps.endBefore; c.st.part.offset = ps.offBefore; c.st.part.crcState = ps.crcBefore; c.st.part.e.csize = ps.csizeBefore;
+        c.st.partSteps.pop_back();
+        if (c.st.partSteps.empty()) c.st.part = PartState();
+        if (!c.arc.truncate(c.st.dataEnd) || !c.arc.flush()) { c.fail("Could not shrink the archive: " + plat::lastError()); return finish(); }
+        CP("undo-truncated");
+        c.pr.doneBytes += n; tick(c, true);
+        pollStop(c);
+        if (c.stop == 1 && k > 0) { c.res.paused = true; c.res.resumable = true; return finish(); }
+    }
+    src.close();
+    plat::setMTime(e.src, e.mtime);
+    if (c.st.entries.empty()) {
+        c.arc.close(); ArcFile::removeAll(c.archive, c.opt.split);
+        c.j.destroy();
+        c.res.archiveRemoved = true;
+    } else {
+        if (!writeIndex(c, false)) return finish();
+        CP("undo-indexed");
+        c.j.destroy(); c.arc.close();
+        c.res.partial = true;
+    }
+    c.pr.filesDone = c.st.entries.size(); c.pr.packedBytes = c.res.archiveRemoved ? 0 : c.st.dataEnd;
+    c.res.ok = true;
+    return finish();
 }
 
 Result run(const Options& opt0, Callbacks& cb) {

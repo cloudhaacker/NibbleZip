@@ -34,6 +34,14 @@ size you choose (pick a preset or type one, such as `250 MB`). Open or check a s
 choosing its `.001` part; all parts must be in the same folder. 7-Zip, WinRAR and PeaZip open these
 parts directly. Windows' built-in zip viewer does not, so join or extract them with one of those.
 
+**Estimate.** Before a job starts, the confirmation shows a rough estimate of the archive size
+and the space you will save, worked out by compressing samples of your files.
+
+**Undo for a half-finished big file.** If a job was stopped part-way through a large file, NibbleZip
+offers on its next start to resume, or to put that file back exactly as it was and close the
+archive. The stored part is checked first, then written back piece by piece while the archive
+shrinks, so it does not need extra room.
+
 **Deletion log** opens a plain text list of every original NibbleZip has removed, with the date,
 size and the archive it went into (`%LOCALAPPDATA%\NibbleZip\deleted-files.log`).
 

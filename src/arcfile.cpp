@@ -12,6 +12,11 @@ bool ArcFile::exists(const std::string& base) {
     plat::Stat st;
     return plat::stat(base, st) || plat::stat(partName(base, 0), st);
 }
+void ArcFile::removeAll(const std::string& base, uint64_t partSize) {
+    if (!partSize) { plat::removeFile(base); return; }
+    plat::Stat st;
+    for (uint64_t i = 0; plat::stat(partName(base, i), st); i++) plat::removeFile(partName(base, i));
+}
 void ArcFile::detect(const std::string& path, std::string& base, uint64_t& partSize) {
     base = path; partSize = 0;
     if (path.size() > 4 && path.compare(path.size() - 4, 4, ".001") == 0) {

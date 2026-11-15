@@ -60,7 +60,7 @@ struct App {
     std::vector<std::string> items;
     bool autoName = true, settingText = false, running = false, closing = false, verifying = false;
     nz::VerifyResult vres;
-    bool batch = false;
+    bool batch = false, undoing = false;
     nz::BatchResult bres;
     std::thread worker;
     std::mutex mu;
@@ -521,7 +521,7 @@ static void setRunningUI(bool on) {
     EnableWindow(g.pause, TRUE); EnableWindow(g.stop, TRUE);
     SetWindowTextW(g.pause, L"Pause");
     if (on) { SendMessageW(g.bar, PBM_SETPOS, 0, 0); SetWindowTextW(g.st1, L"Preparing…"); SetWindowTextW(g.st2, L""); }
-    else { g.verifying = false; g.batch = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); }
+    else { g.verifying = false; g.batch = false; g.undoing = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); }
 }
 static void startVerify(const std::string& path) {
     if (g.worker.joinable()) g.worker.join();
@@ -558,6 +558,21 @@ static void relaunch() {
         CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         DestroyWindow(g.wnd);
     }
+}
+static void startUndo(const std::string& archive) {
+    if (g.worker.joinable()) g.worker.join();
+    g.stopReq = 0; g.pauseFlag = false; g.haveStart = false;
+    { std::lock_guard<std::mutex> l(g.mu); g.prog = nz::Progress(); g.result = nz::Result(); }
+    setRunningUI(true);
+    g.undoing = true;
+    SetWindowTextW(g.st1, L"Checking the stored part…");
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    g.worker = std::thread([archive]() {
+        GuiCb cb;
+        nz::Result r = nz::undoPartial(archive, cb);
+        { std::lock_guard<std::mutex> l(g.mu); g.result = r; }
+        PostMessageW(g.wnd, WM_NZ_DONE, 0, 0);
+    });
 }
 static void startBatch(const std::vector<nz::BatchJob>& jobs) {
     if (g.worker.joinable()) g.worker.join();
@@ -601,10 +616,11 @@ static void onProgress() {
     SendMessageW(g.bar, PBM_SETPOS, (WPARAM)(frac * 1000), 0);
     ULONGLONG now = GetTickCount64();
     if (!g.haveStart && p.totalBytes) { g.haveStart = true; g.startTick = now; g.startDone = p.doneBytes; }
-    std::wstring s1 = g.pauseFlag.load() ? L"Paused" : (p.current.empty() ? (g.verifying ? L"Checking…" : L"Preparing…") : (g.verifying ? L"Checking: " : L"Compressing: ") + W(p.current));
+    std::wstring s1 = g.pauseFlag.load() ? L"Paused" : (p.current.empty() ? (g.verifying ? L"Checking…" : L"Preparing…") : (g.verifying ? L"Checking: " : g.undoing ? L"Putting back: " : L"Compressing: ") + W(p.current));
     wchar_t pct[32]; _snwprintf(pct, 31, L"%.1f%%", frac * 100); pct[31] = 0;
     std::wstring s2 = std::wstring(pct);
-    if (g.verifying) s2 += L"   •   Read " + W(nz::humanSize(p.doneBytes)) + L" of " + W(nz::humanSize(p.totalBytes));
+    if (g.undoing) s2 += L"";
+    else if (g.verifying) s2 += L"   •   Read " + W(nz::humanSize(p.doneBytes)) + L" of " + W(nz::humanSize(p.totalBytes));
     else s2 += L"   •   Archive: " + W(nz::humanSize(p.packedBytes)) + L"   •   Originals removed: " + W(nz::humanSize(p.reclaimedBytes)) +
                (p.jobCount > 1 ? L"   •   Archive " + std::to_wstring(p.jobIndex) + L" of " + std::to_wstring(p.jobCount)
                                : L"   •   Files: " + std::to_wstring(p.filesDone) + L" of " + std::to_wstring(p.filesTotal));
@@ -620,7 +636,7 @@ static void onProgress() {
 static void onDone() {
     if (g.worker.joinable()) g.worker.join();
     SetThreadExecutionState(ES_CONTINUOUS);
-    nz::Result r; nz::VerifyResult v; nz::BatchResult b; bool wasVerify = g.verifying, wasBatch = g.batch;
+    nz::Result r; nz::VerifyResult v; nz::BatchResult b; bool wasVerify = g.verifying, wasBatch = g.batch, wasUndo = g.undoing;
     { std::lock_guard<std::mutex> l(g.mu); r = g.result; v = g.vres; b = g.bres; }
     setRunningUI(false);
     if (g.closing) { DestroyWindow(g.wnd); return; }
@@ -629,6 +645,15 @@ static void onDone() {
                       L", were read back from disk, decompressed and matched their checksums.", MB_OK | MB_ICONINFORMATION);
         else if (v.cancelled) msg(L"Check cancelled.", MB_OK | MB_ICONINFORMATION);
         else msg(L"A problem was found:\n\n" + W(v.error), MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (wasUndo) {
+        if (r.ok) msg(std::wstring(L"The file has been put back exactly as it was.\n\n") +
+                      (r.archiveRemoved ? L"The archive held nothing else, so it was removed."
+                                        : L"The archive was closed and holds the " + std::to_wstring(r.final.filesDone) + L" file(s) that were stored before it. Those originals had already been removed."),
+                      MB_OK | MB_ICONINFORMATION);
+        else if (r.paused) msg(L"Stopped. Nothing is lost. Next time you can carry on putting the file back, or resume the job instead.", MB_OK | MB_ICONINFORMATION);
+        else msg(L"The file could not be put back:\n\n" + W(r.error) + (r.resumable ? L"\n\nNothing is lost. The job is still saved, so you can try again or resume it." : L""), MB_OK | MB_ICONERROR);
         return;
     }
     std::wstring t; UINT icon = MB_ICONINFORMATION;
@@ -665,11 +690,13 @@ static void onDone() {
 }
 static bool offerResume(const nz::JobInfo& ji) {
     std::wstring t = L"An unfinished job was found:\n\n" + W(ji.archive) + L"\n\n" + std::to_wstring(ji.filesDone) + L" file(s) are already stored in it";
-    if (ji.midFile) t += L", and it stopped part-way through:\n" + W(ji.midFileName) + L"\n\nThat file has been partly moved into the archive, so the job needs to be resumed to complete it.\n\nResume now?";
+    if (ji.midFile) t += L", and it stopped part-way through:\n" + W(ji.midFileName) + L"\n\nPart of that file now lives only in the archive.\n\n"
+                         L"Yes = resume and finish the job\nNo = undo: put that file back as it was, then close the archive\nCancel = decide later";
     else t += L".\n\nYes = resume now\nNo = close the archive as it is (files not yet stored stay where they are)\nCancel = decide later";
-    int r = msg(t, (ji.midFile ? MB_YESNO : MB_YESNOCANCEL) | MB_ICONQUESTION);
+    int r = msg(t, MB_YESNOCANCEL | MB_ICONQUESTION);
     if (r == IDYES) { startJob(ji.opt); return true; }
-    if (r == IDNO && !ji.midFile) { nz::Options o = ji.opt; o.finalizeOnly = true; startJob(o); return true; }
+    if (r == IDNO && ji.midFile) { startUndo(ji.archive); return true; }
+    if (r == IDNO) { nz::Options o = ji.opt; o.finalizeOnly = true; startJob(o); return true; }
     return false;
 }
 static void onStartBatch() {
@@ -695,6 +722,15 @@ static void onStartBatch() {
     if (base.eat) t += L"Each original is PERMANENTLY DELETED as soon as its own archive has been written to disk, read back and checked. "
                        L"Deleted originals do not go to the Recycle Bin.\n\nFree space now: " + W(nz::humanSize(fr)) + L".  Largest single item: " + W(nz::humanSize(plan.largestJob)) + L".\n";
     else t += L"Originals will be kept. Nothing is deleted.\n";
+    {
+        HCURSOR oc = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        uint64_t tot = 0, est = nz::estimateArchiveSize(base.inputs, base.format, base.level, tot);
+        SetCursor(oc);
+        if (est && tot) {
+            if (est >= tot - tot / 33) t += L"\nThese files look already compressed, so expect little or no space saving.\n";
+            else t += L"\nEstimated total size of the archives: about " + W(nz::humanSize(est)) + L", saving about " + W(nz::humanSize(tot - est)) + L". This is a rough estimate from samples.\n";
+        }
+    }
     if (base.split) t += L"\nAny archive larger than " + W(nz::humanSize(base.split)) + L" will be written in parts (.001, .002 and so on).\n";
     for (size_t i = 0; i < plan.notes.size() && i < 6; i++) t += L"\n\u2022 " + W(plan.notes[i]);
     t += L"\n\nContinue?";
@@ -726,6 +762,15 @@ static void onStart() {
     } else {
         t += L"Originals will be kept. Nothing is deleted.\n";
     }
+    {
+        HCURSOR oc = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        uint64_t tot = 0, est = nz::estimateArchiveSize(opt.inputs, opt.format, opt.level, tot);
+        SetCursor(oc);
+        if (est && tot) {
+            if (est >= tot - tot / 33) t += L"\nThese files look already compressed, so expect little or no space saving.\n";
+            else t += L"\nEstimated archive size: about " + W(nz::humanSize(est)) + L", saving about " + W(nz::humanSize(tot - est)) + L". This is a rough estimate from samples.\n";
+        }
+    }
     if (opt.split) t += L"\nThe archive will be written in parts of " + W(nz::humanSize(opt.split)) + L" each, named " + W(plat::baseName(arc)) + L".001, .002 and so on.\n";
     for (auto& n : pf.notes) t += L"\n• " + W(n);
     t += L"\n\nContinue?";
@@ -733,7 +778,7 @@ static void onStart() {
     startJob(opt);
 }
 static void onStop() {
-    if (g.verifying) { g.stopReq = 1; g.pauseFlag = false; EnableWindow(g.stop, FALSE); return; }
+    if (g.verifying || g.undoing) { g.stopReq = 1; g.pauseFlag = false; EnableWindow(g.stop, FALSE); return; }
     int r = msg(g.batch ? L"Stop compressing?\n\n"
                           L"Yes = stop now. Everything stored so far is safe and you can continue later.\n\n"
                           L"No = finish the archive in progress, then stop. Items not reached stay where they are.\n\n"
@@ -962,7 +1007,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         if (g.running) {
             if (g.closing) return 0;
-            if (g.verifying) { g.closing = true; g.stopReq = 1; g.pauseFlag = false; return 0; }
+            if (g.verifying || g.undoing) { g.closing = true; g.stopReq = 1; g.pauseFlag = false; return 0; }
             if (msg(L"A job is running.\n\nStop it safely and exit? Everything stored so far is kept and the job can be resumed next time.", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return 0;
             if (!g.running) { DestroyWindow(h); return 0; }
             g.closing = true; g.stopReq = 1; g.pauseFlag = false;

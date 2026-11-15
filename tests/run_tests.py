@@ -233,6 +233,55 @@ def main():
         rc, err = run(pack_args(d, fmt, step, ["--split", str(PART), "--finish-after", "900000"])); assert rc == 0 and "Closed early" in err, (rc, err)
         verify(arc + ".001", fmt, ROOT + "/orig", expect_subset=True)
         print(fmt, "split pause/resume and finish-early OK", flush=True)
+    # 7u. undo: put a half-processed big file back
+    def pause_at(d, fmt, after, extra=()):
+        rc, err = run(pack_args(d, fmt, step, ["--pause-after", str(after), *extra])); assert rc == 3, (rc, err)
+    for fmt in ("7z", "zip"):
+        for after, expect_removed in ((900000, True), (2600000, False)):
+            for extra in ((), ("--split", "300000")):
+                d = fresh("undo_%s_%d_%d" % (fmt, after, len(extra))); arc = d + "/out." + fmt; first = arc + (".001" if extra else "")
+                pause_at(d, fmt, after, extra)
+                rc, err = run(["undo", arc, "--quiet"]); assert rc == 0, err
+                assert not os.path.exists(arc + ".nzj"), "journal left after undo"
+                left = tree(d + "/src"); want = tree(ROOT + "/orig")
+                if expect_removed:
+                    assert not os.path.exists(first), "empty archive should have been removed"
+                    assert left == want, "originals not fully restored"
+                else:
+                    got = verify(first, fmt, ROOT + "/orig", expect_subset=True)
+                    for k, v in want.items():
+                        if v is None or v == b"": continue
+                        assert (k in got) != (k in left), "file in both or neither: " + k
+                        assert got.get(k, left.get(k)) == v, "content differs after undo: " + k
+        # crash at every checkpoint of the undo itself, then finish the undo, or resume forwards instead
+        n = 1; cnt = 0
+        while True:
+            d = fresh("undocrash_" + fmt); arc = d + "/out." + fmt
+            pause_at(d, fmt, 2600000)
+            rc, err = run(["undo", arc, "--quiet"], crash_at=n)
+            if rc == 0: break
+            assert rc == 77, (rc, err)
+            if n % 2:
+                rc, err = run(["undo", arc, "--quiet"])
+                if rc != 0: assert "nothing to put back" in err, err; rc, err = run(["resume", arc, "--finalize", "--quiet"]); assert rc == 0, err
+                got = verify(arc, fmt, ROOT + "/orig", expect_subset=True); left = tree(d + "/src"); want = tree(ROOT + "/orig")
+                for k, v in want.items():
+                    if v is None or v == b"": continue
+                    assert got.get(k, left.get(k)) == v and ((k in got) != (k in left)), "after crashed undo: " + k
+            else:
+                rc, err = run(["resume", arc, "--quiet", "--step", str(step)]); assert rc == 0, err
+                assert src_gone(d); verify(arc, fmt, ROOT + "/orig")
+            n += 1; cnt += 1
+        print(fmt, "undo OK (plain and split, archive kept and removed, %d crash scenarios)" % cnt, flush=True)
+    # 7e. size estimate is in the right region
+    for fmt in ("7z", "zip"):
+        d = fresh("est_" + fmt)
+        p = subprocess.run(PREFIX + [CLI, "estimate", "-f", fmt, d + "/src/game", d + "/src/single file.bin"], env=ENV, capture_output=True, text=True, cwd=ROOT)
+        tot_b, est = map(int, p.stdout.split())
+        rc, err = run(pack_args(d, fmt, step, ["--keep"])); assert rc == 0
+        real = os.path.getsize(d + "/out." + fmt)
+        assert 0.6 * real < est < 1.6 * real, (tot_b, est, real)
+        print(fmt, "estimate %d vs real %d (%.0f%%)" % (est, real, 100.0 * est / real), flush=True)
     # 7b. the built-in checker must catch damage, and must accept archives made by real 7-Zip
     for fmt in ("7z", "zip"):
         d = fresh("corrupt_" + fmt)

@@ -173,6 +173,14 @@ bool removeFile(const std::string& path) {
     }
     return false;
 }
+bool setMTime(const std::string& path, uint64_t mtime) {
+    HANDLE h = CreateFileW(LP(path).c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FILETIME ft; ft.dwLowDateTime = (DWORD)(mtime & 0xFFFFFFFFu); ft.dwHighDateTime = (DWORD)(mtime >> 32);
+    BOOL ok = SetFileTime(h, nullptr, nullptr, &ft);
+    CloseHandle(h);
+    return ok != 0;
+}
 bool removeDir(const std::string& path) {
     std::wstring w = LP(path);
     if (RemoveDirectoryW(w.c_str())) return true;
@@ -351,6 +359,14 @@ bool listDir(const std::string& path, std::vector<DirEnt>& out) {
     return true;
 }
 bool removeFile(const std::string& path) { return unlink(path.c_str()) == 0; }
+bool setMTime(const std::string& path, uint64_t mtime) {
+    if (mtime < 116444736000000000ull) return false;
+    uint64_t t = mtime - 116444736000000000ull;
+    struct timespec ts[2];
+    ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_OMIT;
+    ts[1].tv_sec = (time_t)(t / 10000000ull); ts[1].tv_nsec = (long)((t % 10000000ull) * 100);
+    return utimensat(AT_FDCWD, path.c_str(), ts, 0) == 0;
+}
 bool removeDir(const std::string& path) { return rmdir(path.c_str()) == 0; }
 bool makeDirs(const std::string& path) {
     Stat st;
