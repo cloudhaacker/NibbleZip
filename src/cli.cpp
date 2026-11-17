@@ -28,6 +28,7 @@ static int usage() {
         "  nibblezip-cli pack --each item|file [--outdir DIR] [-f 7z|zip] [-l 0..3] [--keep] INPUT...\n"
         "  nibblezip-cli check [-f 7z|zip] [-l 0..3] [--keep] -o ARCHIVE INPUT...\n"
         "  nibblezip-cli resume ARCHIVE [--finalize]\n"
+        "  nibblezip-cli extract ARCHIVE [--keep] [--dest DIR]\n"
         "  nibblezip-cli verify ARCHIVE\n"
         "  nibblezip-cli pending\n");
     return 2;
@@ -54,7 +55,7 @@ int main(int argc, char** argv) {
 #endif
     if (argc < 2) return usage();
     std::string cmd = argv[1];
-    nz::Options o; CliCb cb; int each = nz::OutSingle; std::string outDir;
+    nz::Options o; CliCb cb; int each = nz::OutSingle; std::string outDir; nz::ExtractOptions xo;
     if (cmd == "pending") {
         for (auto& j : nz::pendingJobs()) printf("%s  (%llu files done%s)\n", j.archive.c_str(), (unsigned long long)j.filesDone, j.midFile ? ", mid-file" : "");
         return 0;
@@ -64,7 +65,10 @@ int main(int argc, char** argv) {
         if (a == "-f" && i + 1 < argc) o.format = !strcmp(argv[++i], "zip") ? nz::FZIP : nz::F7Z;
         else if (a == "-l" && i + 1 < argc) o.level = atoi(argv[++i]);
         else if (a == "-o" && i + 1 < argc) o.archive = argv[++i];
-        else if (a == "--keep") o.eat = false;
+        else if (a == "--keep") { o.eat = false; xo.eat = false; }
+        else if (a == "--dest" && i + 1 < argc) xo.dest = argv[++i];
+        else if (a == "--interval" && i + 1 < argc) xo.testInterval = strtoull(argv[++i], nullptr, 10);
+        else if (a == "--no-precheck") xo.precheck = false;
         else if (a == "--split" && i + 1 < argc) o.split = strtoull(argv[++i], nullptr, 10);
         else if (a == "--each" && i + 1 < argc) each = !strcmp(argv[++i], "file") ? nz::OutPerFile : nz::OutPerItem;
         else if (a == "--outdir" && i + 1 < argc) outDir = argv[++i];
@@ -73,7 +77,7 @@ int main(int argc, char** argv) {
         else if (a == "--step" && i + 1 < argc) o.testStep = strtoull(argv[++i], nullptr, 10);
         else if (a == "--pause-after" && i + 1 < argc) cb.pauseAfter = strtoull(argv[++i], nullptr, 10);
         else if (a == "--finish-after" && i + 1 < argc) cb.finishAfter = strtoull(argv[++i], nullptr, 10);
-        else if ((cmd == "resume" || cmd == "verify" || cmd == "undo") && o.archive.empty()) o.archive = a;
+        else if ((cmd == "resume" || cmd == "verify" || cmd == "undo" || cmd == "extract") && o.archive.empty()) o.archive = a;
         else o.inputs.push_back(a);
     }
     if (cmd == "estimate") o.archive = "-";
@@ -90,6 +94,15 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (o.archive.empty()) return usage();
+    if (cmd == "extract") {
+        xo.archive = o.archive;
+        nz::ExtractResult x = nz::extractArchive(xo, cb);
+        if (!cb.quiet) fprintf(stderr, "\n");
+        for (auto& w : x.warnings) fprintf(stderr, "warning: %s\n", w.c_str());
+        if (x.ok) { fprintf(stderr, "Extracted %llu files (%s) into %s%s\n", (unsigned long long)x.files, nz::humanSize(x.bytes).c_str(), x.dest.c_str(), x.archiveRemoved ? "; the archive was removed" : ""); return 0; }
+        if (x.paused) { fprintf(stderr, "Paused. Run the same command to continue.\n"); return 3; }
+        fprintf(stderr, "Error: %s%s\n", x.error.c_str(), x.resumable ? " (can be resumed)" : ""); return 1;
+    }
     if (cmd == "undo") {
         nz::Result u = nz::undoPartial(o.archive, cb);
         if (!cb.quiet) fprintf(stderr, "\n");

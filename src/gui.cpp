@@ -30,9 +30,10 @@ static const wchar_t* kMenuText = L"Compress and reclaim space (NibbleZip)";
 #define WM_NZ_PROGRESS (WM_APP + 1)
 #define WM_NZ_DONE (WM_APP + 2)
 #define NZ_COPYDATA_ADD 0x4E5A0001
+#define NZ_COPYDATA_EXTRACT 0x4E5A0002
 
 enum { ID_LIST = 100, ID_ADDFILES, ID_ADDFOLDER, ID_REMOVE, ID_CLEAR, ID_ARCHIVE, ID_BROWSE, ID_FORMAT, ID_LEVEL, ID_EAT,
-       ID_START, ID_PAUSE, ID_STOP, ID_MENU, ID_VERIFY, ID_THEME, ID_EATLABEL, ID_OUTPUT, ID_LOG, ID_SPLIT };
+       ID_START, ID_PAUSE, ID_STOP, ID_MENU, ID_VERIFY, ID_THEME, ID_EATLABEL, ID_OUTPUT, ID_LOG, ID_SPLIT, ID_EXTRACT };
 
 static std::wstring W(const std::string& s) {
     if (s.empty()) return std::wstring();
@@ -54,13 +55,19 @@ struct App {
     HWND wnd = nullptr, list = nullptr, archive = nullptr, format = nullptr, level = nullptr, eat = nullptr, info = nullptr,
          bar = nullptr, st1 = nullptr, st2 = nullptr, start = nullptr, pause = nullptr, stop = nullptr, menuBtn = nullptr,
          addFiles = nullptr, addFolder = nullptr, removeBtn = nullptr, clearBtn = nullptr, browse = nullptr,
-         eatLabel = nullptr, verifyBtn = nullptr, themeBtn = nullptr, output = nullptr, saveLabel = nullptr, logBtn = nullptr, split = nullptr;
+         eatLabel = nullptr, verifyBtn = nullptr, themeBtn = nullptr, output = nullptr, saveLabel = nullptr, logBtn = nullptr, split = nullptr, extractBtn = nullptr;
     HFONT font = nullptr, fontBig = nullptr;
     int dpi = 96;
     std::vector<std::string> items;
     bool autoName = true, settingText = false, running = false, closing = false, verifying = false;
     nz::VerifyResult vres;
-    bool batch = false, undoing = false;
+    bool batch = false, undoing = false, extracting = false;
+    std::vector<std::string> xqueue;     // archives waiting for the "extract" question
+    struct XSummary {
+        bool ok = false, paused = false, resumable = false, removed = false, eat = false;
+        std::string error, dest; std::vector<std::string> warnings;
+        uint64_t done = 0, total = 0, files = 0, bytes = 0;
+    } xsum;
     nz::BatchResult bres;
     std::thread worker;
     std::mutex mu;
@@ -344,8 +351,25 @@ static bool menuInstalled() {
 static void setStr(HKEY k, const wchar_t* name, const std::wstring& v) {
     RegSetValueExW(k, name, 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
 }
+static const wchar_t* kExtractKeys[3] = {L"Software\\Classes\\SystemFileAssociations\\.7z\\shell\\NibbleZipExtract",
+                                         L"Software\\Classes\\SystemFileAssociations\\.zip\\shell\\NibbleZipExtract",
+                                         L"Software\\Classes\\SystemFileAssociations\\.001\\shell\\NibbleZipExtract"};
 static bool setMenu(bool on) {
     bool ok = true;
+    for (int i = 0; i < 3; i++) {
+        if (!on) { RegDeleteTreeW(HKEY_CURRENT_USER, kExtractKeys[i]); continue; }
+        HKEY k, c;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, kExtractKeys[i], 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) { ok = false; continue; }
+        std::wstring exe = exePath();
+        setStr(k, nullptr, L"Extract and reclaim space (NibbleZip)");
+        setStr(k, L"Icon", L"\"" + exe + L"\"");
+        setStr(k, L"MultiSelectModel", L"Player");
+        if (RegCreateKeyExW(k, L"command", 0, nullptr, 0, KEY_WRITE, nullptr, &c, nullptr) == ERROR_SUCCESS) {
+            setStr(c, nullptr, L"\"" + exe + L"\" --extract \"%1\"");
+            RegCloseKey(c);
+        } else ok = false;
+        RegCloseKey(k);
+    }
     for (int i = 0; i < 2; i++) {
         if (!on) { RegDeleteTreeW(HKEY_CURRENT_USER, kMenuKeys[i]); continue; }
         HKEY k, c;
@@ -509,7 +533,7 @@ static void formatChanged() {
 // ---------------------------------------------------------------- running a job
 static void setRunningUI(bool on) {
     g.running = on;
-    HWND inputs[] = {g.output, g.logBtn, g.split, g.archive, g.format, g.level, g.eat, g.eatLabel, g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.verifyBtn, g.themeBtn};
+    HWND inputs[] = {g.output, g.logBtn, g.extractBtn, g.split, g.archive, g.format, g.level, g.eat, g.eatLabel, g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.verifyBtn, g.themeBtn};
     for (HWND h : inputs) EnableWindow(h, !on);
     ShowWindow(g.start, on ? SW_HIDE : SW_SHOW);
     ShowWindow(g.pause, on ? SW_SHOW : SW_HIDE);
@@ -521,7 +545,7 @@ static void setRunningUI(bool on) {
     EnableWindow(g.pause, TRUE); EnableWindow(g.stop, TRUE);
     SetWindowTextW(g.pause, L"Pause");
     if (on) { SendMessageW(g.bar, PBM_SETPOS, 0, 0); SetWindowTextW(g.st1, L"Preparing…"); SetWindowTextW(g.st2, L""); }
-    else { g.verifying = false; g.batch = false; g.undoing = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); }
+    else { g.verifying = false; g.batch = false; g.undoing = false; g.extracting = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); }
 }
 static void startVerify(const std::string& path) {
     if (g.worker.joinable()) g.worker.join();
@@ -574,6 +598,74 @@ static void startUndo(const std::string& archive) {
         PostMessageW(g.wnd, WM_NZ_DONE, 0, 0);
     });
 }
+struct XCb : GuiCb {
+    uint64_t idx = 0, count = 0;
+    void progress(const nz::Progress& p) override { nz::Progress q = p; q.jobIndex = idx; q.jobCount = count; GuiCb::progress(q); }
+};
+static void startExtract(const std::vector<std::string>& archives, bool eat) {
+    if (g.worker.joinable()) g.worker.join();
+    g.stopReq = 0; g.pauseFlag = false; g.haveStart = false;
+    { std::lock_guard<std::mutex> l(g.mu); g.prog = nz::Progress(); g.xsum = App::XSummary(); }
+    setRunningUI(true);
+    g.extracting = true;
+    SetWindowTextW(g.st1, L"Opening the archive…");
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    g.worker = std::thread([archives, eat]() {
+        App::XSummary s; s.total = archives.size(); s.eat = eat; s.ok = true;
+        for (size_t i = 0; i < archives.size(); i++) {
+            XCb cb; cb.idx = i + 1; cb.count = archives.size();
+            nz::ExtractOptions o; o.archive = archives[i]; o.eat = eat;
+            nz::ExtractResult r = nz::extractArchive(o, cb);
+            for (auto& w : r.warnings) if (s.warnings.size() < 50) s.warnings.push_back(w);
+            s.files += r.files; s.bytes += r.bytes; s.dest = r.dest; if (r.archiveRemoved) s.removed = true;
+            if (r.ok) { s.done++; continue; }
+            s.ok = false; s.paused = r.paused; s.resumable = r.resumable;
+            s.error = (archives.size() > 1 ? plat::baseName(archives[i]) + ": " : "") + r.error;
+            break;
+        }
+        { std::lock_guard<std::mutex> l(g.mu); g.xsum = s; }
+        PostMessageW(g.wnd, WM_NZ_DONE, 0, 0);
+    });
+}
+// Asks what to do with the archives waiting in the queue, then starts.
+static void promptExtract() {
+    if (g.xqueue.empty() || g.running) return;
+    std::vector<std::string> list; list.swap(g.xqueue);
+    std::wstring t = list.size() == 1 ? L"Extract this archive?\n\n" + W(list[0]) + L"\n\nIts files go into a new folder next to it:\n" + W(nz::defaultExtractDest(list[0]))
+                                      : std::to_wstring(list.size()) + L" archives selected. Each is extracted into its own new folder next to it, named after the archive.";
+    t += L"\n\nYes = extract and reclaim space. The archive is checked first, then gives its space back as its files come out, and is removed once everything has been verified."
+         L"\n\nNo = extract only, and keep the archive."
+         L"\n\nCancel = do nothing.";
+    int r = msg(t, MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (r == IDYES) startExtract(list, true);
+    else if (r == IDNO) startExtract(list, false);
+}
+static void pickExtract() {
+    IFileOpenDialog* d = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d))) || !d) return;
+    DWORD o = 0; d->GetOptions(&o);
+    d->SetOptions(o | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    COMDLG_FILTERSPEC spec[2] = {{L"Archives (*.7z, *.zip, *.001)", L"*.7z;*.zip;*.001"}, {L"All files", L"*.*"}};
+    d->SetFileTypes(2, spec);
+    d->SetTitle(L"Choose archives to extract");
+    if (SUCCEEDED(d->Show(g.wnd))) {
+        IShellItemArray* arr = nullptr;
+        if (SUCCEEDED(d->GetResults(&arr)) && arr) {
+            DWORD n = 0; arr->GetCount(&n);
+            for (DWORD i = 0; i < n; i++) {
+                IShellItem* it = nullptr;
+                if (SUCCEEDED(arr->GetItemAt(i, &it)) && it) {
+                    PWSTR p = nullptr;
+                    if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { g.xqueue.push_back(U(p)); CoTaskMemFree(p); }
+                    it->Release();
+                }
+            }
+            arr->Release();
+        }
+    }
+    d->Release();
+    promptExtract();
+}
 static void startBatch(const std::vector<nz::BatchJob>& jobs) {
     if (g.worker.joinable()) g.worker.join();
     g.stopReq = 0; g.pauseFlag = false; g.haveStart = false;
@@ -616,10 +708,19 @@ static void onProgress() {
     SendMessageW(g.bar, PBM_SETPOS, (WPARAM)(frac * 1000), 0);
     ULONGLONG now = GetTickCount64();
     if (!g.haveStart && p.totalBytes) { g.haveStart = true; g.startTick = now; g.startDone = p.doneBytes; }
-    std::wstring s1 = g.pauseFlag.load() ? L"Paused" : (p.current.empty() ? (g.verifying ? L"Checking…" : L"Preparing…") : (g.verifying ? L"Checking: " : g.undoing ? L"Putting back: " : L"Compressing: ") + W(p.current));
+    const wchar_t* verb = g.extracting ? (p.phase == 1 ? L"Checking: " : L"Extracting: ") : g.verifying ? L"Checking: " : g.undoing ? L"Putting back: " : L"Compressing: ";
+    std::wstring s1 = g.pauseFlag.load() ? L"Paused" : (p.current.empty() ? (g.verifying ? L"Checking…" : g.extracting ? L"Opening the archive…" : L"Preparing…") : verb + W(p.current));
     wchar_t pct[32]; _snwprintf(pct, 31, L"%.1f%%", frac * 100); pct[31] = 0;
     std::wstring s2 = std::wstring(pct);
-    if (g.undoing) s2 += L"";
+    if (g.extracting) {
+        if (p.jobCount > 1) s2 += L"   •   Archive " + std::to_wstring(p.jobIndex) + L" of " + std::to_wstring(p.jobCount);
+        if (p.phase == 1) s2 += L"   •   Checking the archive before anything is changed";
+        else {
+            s2 += L"   •   Files: " + std::to_wstring(p.filesDone) + L" of " + std::to_wstring(p.filesTotal);
+            if (p.reclaimedBytes) s2 += L"   •   Archive space released: " + W(nz::humanSize(p.reclaimedBytes));
+        }
+    }
+    else if (g.undoing) s2 += L"";
     else if (g.verifying) s2 += L"   •   Read " + W(nz::humanSize(p.doneBytes)) + L" of " + W(nz::humanSize(p.totalBytes));
     else s2 += L"   •   Archive: " + W(nz::humanSize(p.packedBytes)) + L"   •   Originals removed: " + W(nz::humanSize(p.reclaimedBytes)) +
                (p.jobCount > 1 ? L"   •   Archive " + std::to_wstring(p.jobIndex) + L" of " + std::to_wstring(p.jobCount)
@@ -636,7 +737,8 @@ static void onProgress() {
 static void onDone() {
     if (g.worker.joinable()) g.worker.join();
     SetThreadExecutionState(ES_CONTINUOUS);
-    nz::Result r; nz::VerifyResult v; nz::BatchResult b; bool wasVerify = g.verifying, wasBatch = g.batch, wasUndo = g.undoing;
+    nz::Result r; nz::VerifyResult v; nz::BatchResult b; bool wasVerify = g.verifying, wasBatch = g.batch, wasUndo = g.undoing, wasExtract = g.extracting;
+    App::XSummary xs; { std::lock_guard<std::mutex> l(g.mu); xs = g.xsum; }
     { std::lock_guard<std::mutex> l(g.mu); r = g.result; v = g.vres; b = g.bres; }
     setRunningUI(false);
     if (g.closing) { DestroyWindow(g.wnd); return; }
@@ -645,6 +747,30 @@ static void onDone() {
                       L", were read back from disk, decompressed and matched their checksums.", MB_OK | MB_ICONINFORMATION);
         else if (v.cancelled) msg(L"Check cancelled.", MB_OK | MB_ICONINFORMATION);
         else msg(L"A problem was found:\n\n" + W(v.error), MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (wasExtract) {
+        std::wstring t; UINT icon = MB_ICONINFORMATION;
+        if (xs.ok) {
+            t = L"All done.\n\nExtracted " + std::to_wstring(xs.files) + L" file(s), " + W(nz::humanSize(xs.bytes));
+            if (xs.total > 1) t += L", from " + std::to_wstring(xs.done) + L" archives, each into its own folder next to it.";
+            else t += L", into:\n" + W(xs.dest);
+            if (xs.eat) t += xs.total > 1 ? L"\n\nEach archive was checked, emptied as its files came out, and removed."
+                                          : (xs.removed ? L"\n\nThe archive was checked, emptied as its files came out, and removed." : L"\n\nThe archive could not be removed; see the notes.");
+            else t += xs.total > 1 ? L"\n\nThe archives were kept." : L"\n\nThe archive was kept.";
+        } else if (xs.paused) {
+            t = L"Stopped. Nothing is lost: the files extracted so far are safe, and the rest is still inside the archive.\n\nStart NibbleZip again to carry on.";
+        } else {
+            icon = MB_ICONERROR;
+            t = L"The extraction stopped because of a problem:\n\n" + W(xs.error);
+            if (xs.resumable) t += L"\n\nNothing is lost. Once the problem is fixed, start NibbleZip again to carry on.";
+        }
+        if (!xs.warnings.empty()) {
+            t += L"\n\nNotes:";
+            for (size_t i = 0; i < xs.warnings.size() && i < 6; i++) t += L"\n\u2022 " + W(xs.warnings[i]);
+            if (icon == MB_ICONINFORMATION) icon = MB_ICONWARNING;
+        }
+        msg(t, MB_OK | icon);
         return;
     }
     if (wasUndo) {
@@ -789,7 +915,10 @@ static void onStart() {
     startJob(opt);
 }
 static void onStop() {
-    if (g.verifying || g.undoing) { g.stopReq = 1; g.pauseFlag = false; EnableWindow(g.stop, FALSE); return; }
+    if (g.verifying || g.undoing || g.extracting) {
+        if (g.extracting) SetWindowTextW(g.st1, L"Stopping safely\u2026");
+        g.stopReq = 1; g.pauseFlag = false; EnableWindow(g.stop, FALSE); EnableWindow(g.pause, FALSE); return;
+    }
     int r = msg(g.batch ? L"Stop compressing?\n\n"
                           L"Yes = stop now. Everything stored so far is safe and you can continue later.\n\n"
                           L"No = finish the archive in progress, then stop. Items not reached stay where they are.\n\n"
@@ -805,6 +934,14 @@ static void onStop() {
 static void onStartup() {
     std::vector<nz::JobInfo> jobs = nz::pendingJobs();
     for (auto& j : jobs) { if (g.running) break; offerResume(j); }
+    if (g.running) return;
+    for (auto& x : nz::pendingExtractions()) {
+        if (g.running) break;
+        std::wstring t = L"An unfinished extraction was found:\n\n" + W(x.archive) + L"\n\nSome of its files are already in:\n" + W(x.dest) +
+                         (x.eat ? L"\n\nThe rest is still inside the archive, which has been partly emptied, so it needs to be finished." : L"\n\nThe archive itself is untouched.") +
+                         L"\n\nResume now?";
+        if (msg(t, MB_YESNO | MB_ICONQUESTION) == IDYES) startExtract(std::vector<std::string>(1, x.archive), x.eat);
+    }
 }
 
 // ---------------------------------------------------------------- window
@@ -842,11 +979,12 @@ static LRESULT CALLBACK listSub(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, 
 static void createControls() {
     ensureFonts();
     const int M = 20, CW = 640 - 2 * M;
-    HWND title = mk(L"STATIC", L"NibbleZip", 0, 0, M, 14, 200, 30, -1);
-    g.logBtn = mk(L"BUTTON", L"Deletion log", WS_TABSTOP, 0, M + CW - 100 - 8 - 150 - 8 - 100, 14, 100, 26, ID_LOG);
+    HWND title = mk(L"STATIC", L"NibbleZip", 0, 0, M, 14, 150, 30, -1);
+    g.extractBtn = mk(L"BUTTON", L"Extract…", WS_TABSTOP, 0, M + CW - 96 - 8 - 134 - 8 - 96 - 8 - 86, 14, 86, 26, ID_EXTRACT);
+    g.logBtn = mk(L"BUTTON", L"Deletion log", WS_TABSTOP, 0, M + CW - 96 - 8 - 134 - 8 - 96, 14, 96, 26, ID_LOG);
     SendMessageW(title, WM_SETFONT, (WPARAM)g.fontBig, TRUE);
-    g.verifyBtn = mk(L"BUTTON", L"Check an archive…", WS_TABSTOP, 0, M + CW - 100 - 8 - 150, 14, 150, 26, ID_VERIFY);
-    g.themeBtn = mk(L"BUTTON", themeLabel(), WS_TABSTOP, 0, M + CW - 100, 14, 100, 26, ID_THEME);
+    g.verifyBtn = mk(L"BUTTON", L"Check an archive…", WS_TABSTOP, 0, M + CW - 96 - 8 - 134, 14, 134, 26, ID_VERIFY);
+    g.themeBtn = mk(L"BUTTON", themeLabel(), WS_TABSTOP, 0, M + CW - 96, 14, 96, 26, ID_THEME);
     mk(L"STATIC", L"Compresses files and frees up their space as it goes, so you don't need room for both.", 0, 0, M, 46, CW, 18, -1);
 
     g.list = mk(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | WS_TABSTOP, WS_EX_CLIENTEDGE, M, 74, CW, 170, ID_LIST);
@@ -916,7 +1054,7 @@ static void createControls() {
     g.pause = mk(L"BUTTON", L"Pause", WS_TABSTOP, 0, M + CW - 268, 588, 130, 30, ID_PAUSE);
     g.stop = mk(L"BUTTON", L"Stop…", WS_TABSTOP, 0, M + CW - 130, 588, 130, 30, ID_STOP);
     if (T.dark) {
-        darken(g.output, L"DarkMode_CFD"); darken(g.logBtn, L"DarkMode_Explorer"); darken(g.split, L"DarkMode_CFD");
+        darken(g.output, L"DarkMode_CFD"); darken(g.logBtn, L"DarkMode_Explorer"); darken(g.extractBtn, L"DarkMode_Explorer"); darken(g.split, L"DarkMode_CFD");
         HWND btns[] = {g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.start, g.pause, g.stop, g.verifyBtn, g.themeBtn, g.eat};
         for (HWND b : btns) darken(b, L"DarkMode_Explorer");
         darken(g.format, L"DarkMode_CFD"); darken(g.level, L"DarkMode_CFD"); darken(g.archive, L"DarkMode_CFD");
@@ -948,6 +1086,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         case ID_BROWSE: browseArchive(); return 0;
         case ID_START: onStart(); return 0;
         case ID_VERIFY: pickVerify(); return 0;
+        case ID_EXTRACT: pickExtract(); return 0;
         case ID_LOG: {
             std::string lp = nz::deletionLogPath(); plat::Stat st;
             if (!plat::stat(lp, st)) msg(L"Nothing has been deleted yet, so there is no log.\n\nOnce NibbleZip removes an original, it is listed here with the date, its size and the archive it went into.", MB_OK | MB_ICONINFORMATION);
@@ -970,7 +1109,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             bool on = !menuInstalled();
             if (!setMenu(on)) msg(L"Could not update the right-click menu.", MB_OK | MB_ICONWARNING);
             else if (on) msg(L"Added. Right-click any file or folder and choose:\n\n" + std::wstring(kMenuText) +
-                             L"\n\nOn Windows 11 it is under \"Show more options\".\n\nIf you move NibbleZip.exe, press this button again to refresh it.", MB_OK | MB_ICONINFORMATION);
+                             L"\n\nArchives (.7z, .zip) also get:\n\nExtract and reclaim space (NibbleZip)\n\nOn Windows 11 these are under \"Show more options\".\n\nIf you move NibbleZip.exe, press this button again to refresh it.", MB_OK | MB_ICONINFORMATION);
             refreshMenuButton();
             return 0;
         }
@@ -998,10 +1137,11 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     }
     case WM_COPYDATA: {
         COPYDATASTRUCT* cd = (COPYDATASTRUCT*)lp;
-        if (!cd || cd->dwData != NZ_COPYDATA_ADD || g.running || !IsWindowEnabled(h)) return FALSE;
+        if (!cd || (cd->dwData != NZ_COPYDATA_ADD && cd->dwData != NZ_COPYDATA_EXTRACT) || g.running || !IsWindowEnabled(h)) return FALSE;
         std::wstring p((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t));
         while (!p.empty() && p.back() == 0) p.pop_back();
-        addItem(U(p));
+        if (cd->dwData == NZ_COPYDATA_EXTRACT) { g.xqueue.push_back(U(p)); SetTimer(h, 2, 700, nullptr); }   // ask once all selected archives have arrived
+        else addItem(U(p));
         return TRUE;
     }
     case WM_CTLCOLORSTATIC:
@@ -1014,11 +1154,14 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return (LRESULT)T.brCtl;
     case WM_NZ_PROGRESS: onProgress(); return 0;
     case WM_NZ_DONE: onDone(); return 0;
-    case WM_TIMER: if (wp == 1) { KillTimer(h, 1); if (!g.running && IsWindowEnabled(h)) onStartup(); } return 0;
+    case WM_TIMER:
+        if (wp == 1) { KillTimer(h, 1); if (!g.running && IsWindowEnabled(h) && g.xqueue.empty()) onStartup(); }
+        else if (wp == 2) { if (IsWindowEnabled(h)) { KillTimer(h, 2); promptExtract(); } }
+        return 0;
     case WM_CLOSE:
         if (g.running) {
             if (g.closing) return 0;
-            if (g.verifying || g.undoing) { g.closing = true; g.stopReq = 1; g.pauseFlag = false; return 0; }
+            if (g.verifying || g.undoing || g.extracting) { g.closing = true; g.stopReq = 1; g.pauseFlag = false; return 0; }
             if (msg(L"A job is running.\n\nStop it safely and exit? Everything stored so far is kept and the job can be resumed next time.", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return 0;
             if (!g.running) { DestroyWindow(h); return 0; }
             g.closing = true; g.stopReq = 1; g.pauseFlag = false;
@@ -1035,12 +1178,12 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, m, wp, lp);
 }
 
-struct SendCtx { const std::wstring* path; bool sent; };
+struct SendCtx { const std::wstring* path; bool sent; ULONG_PTR kind; };
 static BOOL CALLBACK enumProc(HWND h, LPARAM lp) {
     SendCtx* c = (SendCtx*)lp;
     wchar_t cls[128];
     if (!GetClassNameW(h, cls, 127) || wcscmp(cls, kClass) != 0) return TRUE;
-    COPYDATASTRUCT cd; cd.dwData = NZ_COPYDATA_ADD; cd.cbData = (DWORD)((c->path->size() + 1) * sizeof(wchar_t)); cd.lpData = (PVOID)c->path->c_str();
+    COPYDATASTRUCT cd; cd.dwData = c->kind; cd.cbData = (DWORD)((c->path->size() + 1) * sizeof(wchar_t)); cd.lpData = (PVOID)c->path->c_str();
     DWORD_PTR res = 0;
     if (SendMessageTimeoutW(h, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 3000, &res) && res) { c->sent = true; SetForegroundWindow(h); return FALSE; }
     return TRUE;
@@ -1050,9 +1193,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g.inst = inst;
     int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::vector<std::wstring> paths;
-    bool forceNew = false; std::wstring checkPath;
+    bool forceNew = false, extractMode = false; std::wstring checkPath;
     for (int i = 1; argv && i < argc; i++) {
         if (!wcscmp(argv[i], L"--new")) forceNew = true;
+        else if (!wcscmp(argv[i], L"--extract")) extractMode = true;
         else if (!wcscmp(argv[i], L"--check") && i + 1 < argc) { checkPath = argv[++i]; forceNew = true; }
         else paths.push_back(argv[i]);
     }
@@ -1064,7 +1208,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         for (int attempt = 0; attempt < 40; attempt++) {
             bool all = true;
             for (auto it = paths.begin(); it != paths.end();) {
-                SendCtx c{&*it, false};
+                SendCtx c{&*it, false, extractMode ? (ULONG_PTR)NZ_COPYDATA_EXTRACT : (ULONG_PTR)NZ_COPYDATA_ADD};
                 EnumWindows(enumProc, (LPARAM)&c);
                 if (c.sent) it = paths.erase(it); else { all = false; ++it; }
             }
@@ -1096,7 +1240,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (!g.wnd) return 1;
     darkTitleBar(g.wnd);
     createControls();
-    for (auto& p : paths) addItem(U(p));
+    if (extractMode) { for (auto& p : paths) g.xqueue.push_back(U(p)); if (!g.xqueue.empty()) SetTimer(g.wnd, 2, 900, nullptr); }
+    else for (auto& p : paths) addItem(U(p));
     ShowWindow(g.wnd, show);
     UpdateWindow(g.wnd);
     if (menuInstalled()) setMenu(true);   // keep the menu pointing at this exe if it was moved

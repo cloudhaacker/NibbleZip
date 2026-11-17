@@ -23,6 +23,7 @@ struct Progress {
     uint64_t totalBytes = 0, doneBytes = 0, packedBytes = 0, reclaimedBytes = 0;
     uint64_t filesTotal = 0, filesDone = 0;
     uint64_t jobIndex = 0, jobCount = 0;   // when several archives are being made in one go
+    int phase = 0;                         // extraction: 1 = checking the archive first, 2 = extracting
     std::string current;
 };
 
@@ -82,6 +83,29 @@ BatchPlan planBatch(const Options& base, int mode, const std::string& outDir);
 BatchResult runBatch(const std::vector<BatchJob>& jobs, Callbacks& cb);
 std::string deletionLogPath();
 void discardStaleJournal(const std::string& archive);   // only acts when the archive itself does not exist
+
+// ---- extraction
+struct ExtractOptions {
+    std::string archive;      // a .7z or .zip, or the .001 part of a split one
+    std::string dest;         // empty = a new folder next to the archive, named after it
+    bool eat = true;          // shrink the archive as its files come out, and remove it at the end
+    bool precheck = true;     // decompress and check the whole archive before changing anything
+    uint64_t testInterval = 0; // testing: commit this often
+};
+struct ExtractResult {
+    bool ok = false, paused = false, resumable = false, archiveRemoved = false;
+    std::string error, dest;
+    std::vector<std::string> warnings;
+    uint64_t files = 0, bytes = 0;
+    Progress final;
+};
+struct ExtractInfo { std::string archive, dest; bool eat = true; };
+// Extracts a 7z or ZIP. With eat=true the archive gives its disk space back as it is consumed.
+// An interrupted extraction is continued by calling this again with the same archive.
+ExtractResult extractArchive(const ExtractOptions& opt, Callbacks& cb);
+std::vector<ExtractInfo> pendingExtractions();
+bool loadExtraction(const std::string& archive, ExtractInfo& info);
+std::string defaultExtractDest(const std::string& archive);
 
 Preflight preflight(const Options& opt);
 // Reads a finished 7z or ZIP archive from disk, decompresses every file and checks it against its stored checksum.

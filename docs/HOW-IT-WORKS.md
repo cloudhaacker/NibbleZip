@@ -201,6 +201,65 @@ Working backwards means the archive shrinks as the file refills, so Undo needs n
 room. It is journaled like everything else, so an interrupted Undo can be continued, or
 the job can be resumed forwards instead.
 
+## Extraction that shrinks the archive
+
+Extraction runs the same idea in reverse: turn a stretch of the archive into files, prove
+those files are safely on disk, and only then release that stretch of the archive.
+
+### Front to back, releasing space inside the file
+
+An archive's index sits at its end, and decompression only runs forwards. So the extractor
+reads the archive from the front and releases what it has consumed from *inside* the
+archive file, using the same sparse-file mechanism as compression. The index at the end
+and the signature at the start stay intact, which is what lets a later run open the
+half-consumed archive again. For a split archive, parts that have been fully consumed are
+simply deleted.
+
+### Safe restart points
+
+Space can only be released up to a point from which decompression can restart with no
+memory of what came before. Those points are:
+
+- **7z, LZMA2:** any chunk that begins with a dictionary reset. The extractor walks the
+  LZMA2 chunk headers itself, so it sees every such boundary. Multi-threaded 7-Zip and
+  NibbleZip both write one at every block.
+- **ZIP, Deflate:** any block boundary. The journal stores the bit offset and the last
+  32 KB of output, and the decompressor is restarted with `inflatePrime` and
+  `inflateSetDictionary`. This is the technique from zlib's `zran` example, used here to
+  make a single huge ZIP entry resumable.
+- **Stored data:** anywhere.
+- **The end of any file or folder.**
+
+A 7z folder with no reset inside it (single-threaded LZMA2, the older LZMA method, or one
+passed through 7-Zip's x86 filter) is treated as one unit: it is extracted in full and its
+space is released when it is done.
+
+### The commit
+
+At a restart point, once enough output has accumulated:
+
+1. every file written since the last commit is forced to disk, read back, and its checksum
+   compared with the checksum of what the decompressor produced;
+2. the position (and, for Deflate, the 32 KB window) is appended to the extraction journal,
+   `name.7z.nzx`, which is kept in two copies like the compression journal;
+3. the consumed part of the archive is released.
+
+After each commit the decompressor is deliberately thrown away and restarted from the
+journaled state, exactly as a resumed run would. Every commit in every run therefore
+exercises the resume path, not just the runs that crash.
+
+### Check first
+
+Before any of this, in space-saving mode, the whole archive is run through the same
+decompression pipeline with nothing written: every file's size and CRC must match the
+index. A damaged or unsupported archive is refused at this stage, untouched.
+
+### Names
+
+Names from an archive are never trusted. Drive letters, absolute paths, `..`, reserved
+device names and characters Windows cannot store are rewritten, so no entry can be written
+outside the destination folder. Duplicate names get a numbered suffix.
+
 ## The checker
 
 "Check an archive" opens a finished 7z or ZIP from disk (including split ones), streams
@@ -224,6 +283,13 @@ testing and on Windows for real.
   a second time during the resume.
 - **Numbers at the time of writing:** 357 crash scenarios for plain jobs, 179 with split
   archives, 33 through Undo, and several hundred through the separate-archive modes.
+- **Extraction** is tested against archives made by NibbleZip, by 7-Zip in eight layouts
+  (default with the executable filter, small blocks, single-threaded solid, LZMA, stored,
+  non-solid, ZIP) and by Python's zipfile (mixed methods, ZIP64). Each is extracted with a
+  crash at every checkpoint and the result compared with what 7-Zip extracts. Archives that
+  must be refused (encrypted, unsupported methods, damaged, not an archive) are checked to
+  be left byte-for-byte untouched, and a ZIP full of hostile names must stay inside its
+  destination folder.
 - **Large files.** A separate test compresses files over 4 GB, checks ZIP64, and measures
   peak disk use to confirm that space really is released as the job runs.
 - **Damage.** Flipped bytes and missing parts must be caught by the checker.
@@ -241,6 +307,7 @@ file on NTFS is verified on real Windows by hand, not by the automated suite.
 - Releasing space inside a big file needs NTFS.
 - The archive has to be on the same drive as the files for the space saving to matter.
 - No encryption, no RAR.
+- Extraction cannot release space inside a 7z folder that has no dictionary resets.
 
 ## Source map
 
@@ -249,6 +316,8 @@ file on NTFS is verified on real Windows by hand, not by the automated suite.
 | `src/engine.cpp`     | scanning, step sizing, the core loop, 7z and ZIP writers, journal, resume, Undo, estimate |
 | `src/arcfile.cpp`    | one archive as a single file or as split parts                   |
 | `src/batch.cpp`      | planning and running separate archives                           |
+| `src/extract.cpp`    | extraction, restart points, the extraction journal               |
+| `src/common.h`       | pieces shared by compressor and extractor (journal, checkpoints) |
 | `src/verify.cpp`     | the archive checker                                              |
 | `src/platform.cpp`   | Win32 and POSIX file operations, including hole punching         |
 | `src/gui.cpp`        | the Windows interface                                            |

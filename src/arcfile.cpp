@@ -12,9 +12,14 @@ bool ArcFile::exists(const std::string& base) {
     plat::Stat st;
     return plat::stat(base, st) || plat::stat(partName(base, 0), st);
 }
-void ArcFile::removeAll(const std::string& base, uint64_t partSize) {
+void ArcFile::removeAll(const std::string& base, uint64_t partSize, uint64_t totalSize) {
     if (!partSize) { plat::removeFile(base); return; }
     plat::Stat st;
+    if (totalSize) {
+        uint64_t n = (totalSize + partSize - 1) / partSize;
+        for (uint64_t i = 0; i < n; i++) if (plat::stat(partName(base, i), st)) plat::removeFile(partName(base, i));
+        return;
+    }
     for (uint64_t i = 0; plat::stat(partName(base, i), st); i++) plat::removeFile(partName(base, i));
 }
 void ArcFile::detect(const std::string& path, std::string& base, uint64_t& partSize) {
@@ -60,6 +65,55 @@ bool ArcFile::openExisting(const std::string& base, uint64_t partSize, bool read
     if (n == 0) return false;
     open_ = true;
     return part(0, false) != nullptr;
+}
+bool ArcFile::totalSizeOf(const std::string& base, uint64_t partSize, uint64_t& total) {
+    plat::Stat st; total = 0;
+    if (!partSize) { if (!plat::stat(base, st)) return false; total = st.size; return true; }
+    uint64_t n = 0;
+    while (plat::stat(partName(base, n), st)) { total += st.size; n++; }
+    return n > 0;
+}
+bool ArcFile::openForExtract(const std::string& base, uint64_t partSize, uint64_t totalSize, bool writable) {
+    close();
+    base_ = base; part_ = partSize; ro_ = !writable; total_ = totalSize; released_ = 0;
+    open_ = true;
+    if (!part_) {
+        uint64_t sz = 0; plat::File* f = part(0, false);
+        if (!f || !f->size(sz) || sz != totalSize) { close(); return false; }
+        return true;
+    }
+    // Parts that were already consumed may be gone; the last part must still be there.
+    plat::Stat st;
+    uint64_t last = totalSize ? (totalSize - 1) / part_ : 0;
+    if (!plat::stat(partName(base, last), st)) { close(); return false; }
+    return true;
+}
+bool ArcFile::releaseBefore(uint64_t pos, uint64_t keepHead) {
+    if (ro_ || !open_ || pos <= keepHead || pos <= released_) return true;
+    const uint64_t mb = 1ull << 20;
+    if (!part_) {
+        plat::File* f = part(0, false);
+        uint64_t from = std::max(keepHead, released_ & ~(mb - 1));
+        if (!f || !f->punchHole(from, pos - from)) return false;
+        released_ = pos;
+        return true;
+    }
+    bool ok = true;
+    uint64_t firstIdx = released_ / part_, curIdx = pos / part_;
+    for (uint64_t i = firstIdx; i <= curIdx; i++) {
+        uint64_t pStart = i * part_, pEnd = pStart + part_;
+        if (i >= 1 && pEnd <= pos) {            // a whole part is no longer needed: delete it (part 1 is kept as the anchor)
+            for (size_t k = 0; k < slots_.size(); k++) if (slots_[k]->idx == i) { slots_[k]->f.close(); slots_.erase(slots_.begin() + k); break; }
+            plat::Stat st;
+            if (plat::stat(partName(base_, i), st) && !plat::removeFile(partName(base_, i))) ok = false;
+        } else {
+            uint64_t from = i == 0 ? keepHead : 0, to = std::min(pos, pEnd) - pStart;
+            plat::Stat st;
+            if (to > from && plat::stat(partName(base_, i), st)) { plat::File* f = part(i, false); if (!f || !f->punchHole(from, to - from)) ok = false; }
+        }
+    }
+    released_ = pos;
+    return ok;
 }
 void ArcFile::close() {
     for (auto& s : slots_) { if (s->dirty) s->f.flush(); s->f.close(); }

@@ -3,8 +3,9 @@
 **Compress in place. Verify, then delete.**
 
 NibbleZip compresses files into a 7z or ZIP archive and frees up the originals' disk space
-*as it goes*, so you never need room for both the files and the archive at once. It is for
-the moment when a drive is too full to compress the things that are filling it.
+*as it goes*, so you never need room for both the files and the archive at once. It also
+works the other way: it extracts an archive while the archive gives its space back. It is
+for the moment when a drive is too full to compress, or unpack, the things that are filling it.
 
 ![The NibbleZip window](docs/images/main.png)
 
@@ -42,6 +43,30 @@ to try it for the first time.
 **Add to right-click menu** puts "Compress and reclaim space (NibbleZip)" on the right-click
 menu of files and folders (under "Show more options" on Windows 11). Select as many items
 as you like; they all arrive in one window.
+
+## Extracting
+
+Press **Extract...** and choose one or more `.7z` or `.zip` archives (for a split archive,
+choose its `.001` part), or right-click archives in Explorer and choose "Extract and reclaim
+space (NibbleZip)". Any number of archives can be selected at once.
+
+![Choosing how to extract](docs/images/extract-ask.png)
+
+- **Extract and reclaim space.** The whole archive is decompressed and checked against its
+  checksums first, and nothing is touched if that fails. Then its files are written out, and
+  as each stretch of them is verified on disk, the part of the archive they came from is
+  released. When everything is out and verified, what is left of the archive is removed.
+- **Extract only** leaves the archive exactly as it was.
+
+Files go into a new folder next to the archive, named after it. Stop, a crash or a power cut
+can be resumed just like compression.
+
+![Extracting while the archive shrinks](docs/images/extract-progress.png)
+
+It reads 7z archives that use LZMA2, LZMA or no compression (including 7-Zip's filter for
+programs), and ZIP archives that use Deflate or no compression. Anything else, such as
+password-protected archives, is refused with a message before anything is changed, and RAR
+is not supported.
 
 ## Features
 
@@ -106,6 +131,12 @@ tested, is in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 - RAR archives cannot be created: the RAR compressor is proprietary to WinRAR.
 - 7z archives are written in solid blocks of one step rather than one giant solid block.
 - No password protection yet.
+- When extracting, space is released at safe restart points inside the archive. A 7z made
+  with multi-threaded LZMA2 (7-Zip's default, and what NibbleZip writes) has one every block,
+  and a ZIP has them throughout. A 7z packed as one single-threaded solid block, or with the
+  older LZMA method, has none, so its space comes back only when that block is finished.
+- A partly extracted archive is no longer a complete archive. Finish the extraction; do not
+  move or edit the archive or the journal in between.
 
 ## No warranty, use at your own risk
 
@@ -131,6 +162,7 @@ To build it yourself you need Python with `pip install ziglang`, plus the 7-Zip 
     ./build-linux.sh             # command-line build used by the tests
     python3 tests/run_tests.py   # round-trips against 7-Zip and unzip, a crash injected at every checkpoint
     python3 tests/batch_test.py  # separate-archive modes
+    python3 tests/extract_test.py  # extraction, against archives made by 7-Zip and others
     python3 tests/big_test.py    # files over 4 GB, peak disk use
 
 The tests need 7-Zip (`7zz` or `7z`) and `unzip` on the PATH.
@@ -138,7 +170,8 @@ The tests need 7-Zip (`7zz` or `7z`) and `unzip` on the PATH.
 ## Credits
 
 Inspired by [HatchZip](https://hatchzip.dev), which extracts archives while shrinking them.
-NibbleZip does the reverse and shares no code with it.
+NibbleZip started as the reverse of that idea. Its own extraction works differently (front
+to back, releasing space inside the file) and it shares no code with HatchZip.
 
 Compression code: LZMA SDK by Igor Pavlov (public domain) and zlib by Jean-loup Gailly and
 Mark Adler (zlib licence).
