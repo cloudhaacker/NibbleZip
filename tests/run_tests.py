@@ -4,7 +4,7 @@ import os, random, shutil, subprocess, sys, zipfile, filecmp
 
 ROOT = os.environ.get("NZ_TEST_ROOT", "/tmp/nzt")
 CLI = os.path.abspath(os.path.join(os.path.dirname(__file__), "../build/linux/nibblezip-cli"))
-SEVENZ = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../deps/node_modules/7zip-bin-full/linux/x64/7zz"))
+SEVENZ = os.environ.get("NZ_7ZZ") or shutil.which("7zz") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../deps/node_modules/7zip-bin-full/linux/x64/7zz"))
 ENV = dict(os.environ, NIBBLEZIP_HOME=ROOT + "/home")
 
 def make_dataset(dst, seed=1):

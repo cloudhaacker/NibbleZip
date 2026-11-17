@@ -1,3 +1,5 @@
 build/
+deps/
 __pycache__/
 *.nzj
+*.pdb

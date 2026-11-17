@@ -1,96 +1,144 @@
 # NibbleZip
 
-Compresses files into a 7z or ZIP archive and frees up the originals' disk space *as it goes*,
-so you never need room for both the files and the archive at once.
+**Compress in place. Verify, then delete.**
 
-## IMPORTANT: no warranty, use at your own risk
+NibbleZip compresses files into a 7z or ZIP archive and frees up the originals' disk space
+*as it goes*, so you never need room for both the files and the archive at once. It is for
+the moment when a drive is too full to compress the things that are filling it.
 
-NibbleZip **permanently deletes your original files** as it compresses them. That is its purpose
-and it cannot be undone. The software is provided "as is", without warranty of any kind. The
-authors and contributors are **not responsible or liable for any loss of data** or any other
-damage arising from its use. Keep a backup of anything you cannot afford to lose. See
-`LICENSE.txt` for the full terms. The app asks you to accept this the first time it runs.
+![The NibbleZip window](docs/images/main.png)
+
+> **Beta.** NibbleZip permanently deletes your original files as it compresses them. That
+> is its purpose and it cannot be undone. Try it on copies first, and keep a backup of
+> anything you cannot afford to lose. See "No warranty" below.
+
+## Download
+
+Get the latest `NibbleZip-x.y.zip` from the [Releases](../../releases) page, unzip it
+anywhere and run `NibbleZip.exe`. There is nothing to install. It needs 64-bit Windows 10
+or 11.
+
+Windows may show a blue "Windows protected your PC" box because the program is not
+code-signed: choose **More info > Run anyway**.
 
 ## Using it
 
-1. Run `NibbleZip.exe` (no install). Windows may show a blue "Windows protected your PC" box
-   because the program is not code-signed: choose **More info > Run anyway**.
-2. Drag files or folders into the window, or use **Add files / Add folder**.
-3. Pick 7z (smallest) or ZIP (opens everywhere) and a compression level, then press **Start**.
-4. Optional: **Add to right-click menu** puts "Compress and reclaim space (NibbleZip)" on the
-   right-click menu of files and folders (under "Show more options" on Windows 11).
+1. Drag files or folders into the window, or use **Add files / Add folder**.
+2. Pick 7z (smallest) or ZIP (opens everywhere) and a compression level.
+3. Press **Start** and read the confirmation. It tells you what will be deleted, how much
+   free space is needed and roughly how big the archive will be.
 
-**Check an archive** re-reads a finished 7z or ZIP from disk, decompresses every file and compares
-it with its stored checksum. **Theme** switches between following Windows, light and dark.
+![Confirmation with the size estimate](docs/images/confirm.png)
 
-**Create** chooses between one archive containing everything, a separate archive for each item
-in the list, or a separate archive for each file (including files inside folders, for example a
-ROM folder where every game becomes its own zip). Separate archives are named after their
-originals and go next to them, or into a folder you pick. Items whose archive already exists are
-left alone, so pressing Start again after a stop simply carries on.
+While it runs you can pause, or stop and pick the job up again later.
 
-**Split into parts** writes the archive as `name.7z.001`, `name.7z.002` and so on, each of the
-size you choose (pick a preset or type one, such as `250 MB`). Open or check a split archive by
-choosing its `.001` part; all parts must be in the same folder. 7-Zip, WinRAR and PeaZip open these
-parts directly. Windows' built-in zip viewer does not, so join or extract them with one of those.
+![A job in progress](docs/images/progress.png)
 
-**Estimate.** Before a job starts, the confirmation shows a rough estimate of the archive size
-and the space you will save, worked out by compressing samples of your files.
+![The finish message](docs/images/done.png)
 
-**Undo for a half-finished big file.** If a job was stopped part-way through a large file, NibbleZip
-offers on its next start to resume, or to put that file back exactly as it was and close the
-archive. The stored part is checked first, then written back piece by piece while the archive
-shrinks, so it does not need extra room.
+Untick "Delete each original..." to use it as an ordinary archiver. That is the best way
+to try it for the first time.
 
-**Deletion log** opens a plain text list of every original NibbleZip has removed, with the date,
-size and the archive it went into (`%LOCALAPPDATA%\NibbleZip\deleted-files.log`).
+**Add to right-click menu** puts "Compress and reclaim space (NibbleZip)" on the right-click
+menu of files and folders (under "Show more options" on Windows 11). Select as many items
+as you like; they all arrive in one window.
 
-The format and compression level you last used are remembered. At the end of a job the app
-reports the archive size, how much of the originals it removed, and the net space saved.
+## Features
 
-Data that is already compressed (video, music, zips, most game archives) is detected by sampling
-and stored as it is instead of being recompressed, which is many times faster for almost no size
-difference.
+- **Create** one archive containing everything, a separate archive for each item in the
+  list, or a separate archive for each file (for example a ROM folder where every game
+  becomes its own zip). Separate archives are named after their originals and go next to
+  them, or into a folder you pick. Items whose archive already exists are left alone, so
+  pressing Start again after a stop simply carries on.
+- **Split into parts** writes the archive as `name.7z.001`, `name.7z.002` and so on, each
+  of the size you choose (pick a preset or type one, such as `250 MB`). Open or check a
+  split archive by choosing its `.001` part; all parts must be in the same folder. 7-Zip,
+  WinRAR and PeaZip open these parts directly. Windows' built-in zip viewer does not.
+- **Check an archive** re-reads a finished 7z or ZIP from disk, decompresses every file and
+  compares it with its stored checksum.
+- **Estimate.** Before a job starts, the confirmation shows a rough estimate of the archive
+  size and the space you will save, worked out by compressing samples of your files.
+- **Already-compressed data** (video, music, zips, most game archives) is detected by
+  sampling and stored as it is instead of being recompressed, which is many times faster
+  for almost no size difference.
+- **Stop and resume.** After a stop, a crash or a power cut, NibbleZip offers on its next
+  start to continue exactly where it left off.
 
-Untick "Delete each original..." to use it as an ordinary archiver. That is the best way to try
-it for the first time.
+  ![Resuming an unfinished job](docs/images/resume.png)
+
+- **Undo for a half-finished big file.** If a job was stopped part-way through a large
+  file, you can instead put that file back exactly as it was and close the archive.
+- **Deletion log** opens a plain text list of every original NibbleZip has removed, with
+  the date, size and the archive it went into.
+- **Theme** switches between following Windows, light and dark.
 
 ## How it stays safe
 
-* **Check before starting.** It works out how much free space one step needs and refuses to start
-  if that is not available.
-* **Verify, then delete.** Each chunk is written to the archive, forced to disk, read back from
-  disk, decompressed, and compared byte-for-byte with the source. Only then is the source released.
-* **Journal.** Every committed step is recorded in a small `.nzj` file next to the archive, with a
-  second copy under `%LOCALAPPDATA%\NibbleZip\journals`. After a crash, power cut or Stop, start
-  NibbleZip again and it offers to resume exactly where it left off.
-* **Always a valid archive between files.** The archive index is rewritten after every file or batch.
-* Files that are in use, change while being read, or are links/junctions are skipped and left alone.
+- **Check before starting.** It works out how much free space one step needs and refuses to
+  start if that is not available.
+- **Verify, then delete.** Each chunk is written to the archive, forced to disk, read back
+  from disk, decompressed, and compared byte for byte with the source. Only then is the
+  source released.
+- **Journal.** Every committed step is recorded in a small `.nzj` file next to the archive,
+  with a second copy under `%LOCALAPPDATA%\NibbleZip\journals`.
+- **Always a valid archive between files.** The archive index is rewritten after every file
+  or batch.
+- Files that are in use, change while being read, or are links or junctions are skipped
+  and left alone.
+
+The full design, including why a crash at any point cannot lose data and how that is
+tested, is in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
 ## How space is reclaimed
 
-* Small files are compressed together in batches; the whole batch is deleted once verified.
-* A file bigger than one step (64 MB - 1 GB depending on level and RAM) is compressed a step at a
-  time, and the part already stored is released from inside the file (NTFS sparse "hole punching").
-  A half-processed big file is therefore only complete again once the job is resumed and finished.
+- Small files are compressed together in batches; the whole batch is deleted once verified.
+- A file bigger than one step (64 MB to 1 GB depending on level and RAM) is compressed a
+  step at a time, and the part already stored is released from inside the file (NTFS
+  sparse "hole punching"). A half-processed big file is therefore only complete again once
+  the job is resumed and finished, or undone.
 
 ## Limits
 
-* Deleted originals do not go to the Recycle Bin.
-* Releasing space inside a big file needs NTFS. On exFAT/FAT32 drives a big file is only freed when
-  it is finished, so it needs room for its compressed copy.
-* The archive must be on the same drive as the files for the space saving to matter.
-* RAR archives cannot be created: the RAR compressor is proprietary to WinRAR.
-* 7z archives are written in solid blocks of one step rather than one giant solid block.
+- Deleted originals do not go to the Recycle Bin.
+- Releasing space inside a big file needs NTFS. On exFAT or FAT32 drives a big file is only
+  freed when it is finished, so it needs room for its compressed copy.
+- The archive must be on the same drive as the files for the space saving to matter.
+- RAR archives cannot be created: the RAR compressor is proprietary to WinRAR.
+- 7z archives are written in solid blocks of one step rather than one giant solid block.
+- No password protection yet.
+
+## No warranty, use at your own risk
+
+The software is provided "as is", without warranty of any kind. The authors and
+contributors are **not responsible or liable for any loss of data** or any other damage
+arising from its use. See [LICENSE.txt](LICENSE.txt) for the full terms. The app asks you
+to accept this the first time it runs.
 
 ## Building
 
-Needs Python with `pip install ziglang`, the 7-Zip sources (`github.com/ip7z/7zip`, only the
-public-domain `C/` folder is used) and zlib (`github.com/madler/zlib`) checked out in `../deps`.
+Every release on the Releases page is built by GitHub from this source by
+[the workflow in this repository](.github/workflows/build.yml), which also runs the test
+suite first.
 
-    ./build-windows.sh     # NibbleZip.exe and nibblezip-cli.exe
-    ./build-linux.sh       # command-line build used by the tests
-    python3 tests/run_tests.py   # round-trips against 7-Zip/unzip, crash injected at every checkpoint
-    python3 tests/big_test.py    # >4 GB files, peak disk use
+To build it yourself you need Python with `pip install ziglang`, plus the 7-Zip sources
+(only the public-domain `C/` folder is used) and zlib:
 
-Compression code: LZMA SDK by Igor Pavlov (public domain) and zlib by Jean-loup Gailly and Mark Adler (zlib licence).
+    mkdir deps
+    git clone --depth 1 --branch 26.06 https://github.com/ip7z/7zip.git deps/7zip
+    git clone --depth 1 --branch v1.4 https://github.com/madler/zlib.git deps/zlib
+
+    ./build-windows.sh           # NibbleZip.exe and nibblezip-cli.exe (cross-compiled)
+    ./build-linux.sh             # command-line build used by the tests
+    python3 tests/run_tests.py   # round-trips against 7-Zip and unzip, a crash injected at every checkpoint
+    python3 tests/batch_test.py  # separate-archive modes
+    python3 tests/big_test.py    # files over 4 GB, peak disk use
+
+The tests need `7zz` (7-Zip) and `unzip` on the PATH.
+
+## Credits
+
+Inspired by [HatchZip](https://hatchzip.dev), which extracts archives while shrinking them.
+NibbleZip does the reverse and shares no code with it.
+
+Compression code: LZMA SDK by Igor Pavlov (public domain) and zlib by Jean-loup Gailly and
+Mark Adler (zlib licence).

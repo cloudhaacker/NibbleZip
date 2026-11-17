@@ -31,6 +31,11 @@ int main(int argc, char** argv) {
             SendMessageW(w, WM_COMMAND, MAKEWPARAM(id, CBN_SELCHANGE), (LPARAM)GetDlgItem(w, id));
             continue;
         }
+        if (!strcmp(argv[i], "check")) {   // check <id> <0|1>
+            int id = atoi(argv[++i]), v = atoi(argv[++i]); HWND w = FindWindowW(L"NibbleZipMainWindow", 0);
+            SendMessageW(GetDlgItem(w, id), BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0);
+            continue;
+        }
         if (!strcmp(argv[i], "settext")) {   // settext <id> <text>
             int id = atoi(argv[++i]); HWND w = FindWindowW(L"NibbleZipMainWindow", 0);
             wchar_t t[512]; MultiByteToWideChar(CP_UTF8, 0, argv[++i], -1, t, 511);
@@ -43,6 +48,18 @@ int main(int argc, char** argv) {
             if (!g_dlg) { printf("no dialog appeared\n"); return 1; }
             printf("dialog:\n"); EnumChildWindows(g_dlg, dumpChild, 0); fflush(stdout);
             if (id >= 0) { Sleep(300); PostMessageW(g_dlg, WM_COMMAND, id, 0); Sleep(500); }
+            continue;
+        }
+        if (!strcmp(argv[i], "rect")) {   // rect main|dialog : prints left top right bottom
+            HWND w = FindWindowW(L"NibbleZipMainWindow", 0);
+            if (!strcmp(argv[++i], "dialog")) { g_dlg = 0; for (int t = 0; t < 100 && !g_dlg; t++) { EnumWindows(findDlg, 0); if (!g_dlg) Sleep(100); } w = g_dlg; }
+            RECT r = {0, 0, 0, 0}; if (w) GetWindowRect(w, &r);
+            printf("RECT %ld %ld %ld %ld\n", r.left, r.top, r.right, r.bottom); fflush(stdout);
+            continue;
+        }
+        if (!strcmp(argv[i], "move")) {   // move <x> <y> : place the main window
+            int x = atoi(argv[++i]), y = atoi(argv[++i]); HWND w = FindWindowW(L"NibbleZipMainWindow", 0);
+            if (w) SetWindowPos(w, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             continue;
         }
         if (!strcmp(argv[i], "status")) {

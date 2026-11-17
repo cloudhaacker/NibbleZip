@@ -2,7 +2,9 @@
 # Builds the command-line tool for Linux (used for automated testing).
 set -e
 cd "$(dirname "$0")"
-SDK=${SDK:-../deps/7zip/C}; ZL=${ZL:-../deps/zlib}
+# The compression libraries are looked for in ./deps first (see README), then ../deps.
+if [ -d deps/7zip/C ]; then D=deps; else D=../deps; fi
+SDK=${SDK:-$D/7zip/C}; ZL=${ZL:-$D/zlib}
 mkdir -p build/linux
 OBJ=""
 for f in 7zCrc 7zCrcOpt Alloc CpuArch LzFind LzFindMt LzFindOpt Lzma2Enc LzmaEnc Lzma2Dec LzmaDec MtCoder MtDec Threads 7zStream 7zArcIn 7zDec 7zBuf Bcj2 Bra Bra86 BraIA64 Delta; do

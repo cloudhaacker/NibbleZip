@@ -2,7 +2,9 @@
 # Cross-compiles NibbleZip.exe (GUI) and nibblezip-cli.exe for 64-bit Windows using zig (pip install ziglang).
 set -e
 cd "$(dirname "$0")"
-SDK=${SDK:-../deps/7zip/C}; ZL=${ZL:-../deps/zlib}
+# The compression libraries are looked for in ./deps first (see README), then ../deps.
+if [ -d deps/7zip/C ]; then D=deps; else D=../deps; fi
+SDK=${SDK:-$D/7zip/C}; ZL=${ZL:-$D/zlib}
 ZIG="python3 -m ziglang"; T="-target x86_64-windows-gnu"
 mkdir -p build/win
 OBJ=""

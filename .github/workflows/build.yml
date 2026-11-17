@@ -1,0 +1,64 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch compression libraries (pinned versions)
+        run: |
+          mkdir -p deps
+          git clone --depth 1 --branch 26.06 https://github.com/ip7z/7zip.git deps/7zip
+          git clone --depth 1 --branch v1.4 https://github.com/madler/zlib.git deps/zlib
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y 7zip unzip
+          python3 -m pip install --break-system-packages ziglang
+
+      - name: Build the command-line engine (Linux) and run the test suite
+        run: |
+          ./build-linux.sh
+          NZ_CRASH_STRIDE=9 python3 tests/run_tests.py
+          NZ_CRASH_STRIDE=15 python3 tests/batch_test.py
+
+      - name: Build NibbleZip.exe (cross-compiled for 64-bit Windows)
+        run: ./build-windows.sh
+
+      - name: Package
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF" in refs/tags/*) ;; *) VER="dev-${GITHUB_SHA::7}" ;; esac
+          mkdir pkg
+          cp build/win/NibbleZip.exe pkg/
+          sed -e '/^ *!\[/d' README.md > pkg/README.txt
+          cp LICENSE.txt pkg/
+          (cd pkg && zip -q ../NibbleZip-$VER.zip NibbleZip.exe README.txt LICENSE.txt)
+          sha256sum NibbleZip-$VER.zip | tee NibbleZip-$VER.zip.sha256
+          echo "PKG=NibbleZip-$VER.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NibbleZip
+          path: |
+            ${{ env.PKG }}
+            ${{ env.PKG }}.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "NibbleZip $GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" "$PKG" "$PKG.sha256" --clobber
