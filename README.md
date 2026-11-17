@@ -133,7 +133,7 @@ To build it yourself you need Python with `pip install ziglang`, plus the 7-Zip 
     python3 tests/batch_test.py  # separate-archive modes
     python3 tests/big_test.py    # files over 4 GB, peak disk use
 
-The tests need `7zz` (7-Zip) and `unzip` on the PATH.
+The tests need 7-Zip (`7zz` or `7z`) and `unzip` on the PATH.
 
 ## Credits
 

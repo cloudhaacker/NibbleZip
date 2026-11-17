@@ -6,7 +6,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CLI = os.path.join(HERE, "../build/linux/nibblezip-cli")
 PREFIX = os.environ.get("NZ_CLI_PREFIX", "").split()
 if PREFIX: CLI = os.path.join(HERE, "../build/win/nibblezip-cli.exe")
-SEVENZ = os.environ.get("NZ_7ZZ") or shutil.which("7zz") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../deps/node_modules/7zip-bin-full/linux/x64/7zz"))
+SEVENZ = os.environ.get("NZ_7ZZ") or shutil.which("7zz") or shutil.which("7z") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../deps/node_modules/7zip-bin-full/linux/x64/7zz"))
 STRIDE = int(os.environ.get("NZ_CRASH_STRIDE", "5"))
 ENV = dict(os.environ, NIBBLEZIP_HOME=ROOT + "/home")
 

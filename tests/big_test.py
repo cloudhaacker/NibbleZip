@@ -3,7 +3,7 @@
 import os, random, shutil, subprocess, sys, threading, time, hashlib
 ROOT = "/tmp/nzbig"
 CLI = os.path.abspath(os.path.join(os.path.dirname(__file__), "../build/linux/nibblezip-cli"))
-SEVENZ = os.environ.get("NZ_7ZZ") or shutil.which("7zz") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../deps/node_modules/7zip-bin-full/linux/x64/7zz"))
+SEVENZ = os.environ.get("NZ_7ZZ") or shutil.which("7zz") or shutil.which("7z") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../deps/node_modules/7zip-bin-full/linux/x64/7zz"))
 ENV = dict(os.environ, NIBBLEZIP_HOME=ROOT + "/home", NIBBLEZIP_CPUS="4")
 
 def used(d):
