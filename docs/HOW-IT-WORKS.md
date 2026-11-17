@@ -4,6 +4,18 @@ This is the under-the-hood tour: what the program is trying to do, the rules it 
 that it never loses data, and how the pieces fit together. The user guide is in the
 [README](../README.md).
 
+## Who wrote this
+
+All of the code, the tests and this document were written by an AI (Claude, made by
+Anthropic) at the request of the project's author, who supplied the idea and the
+requirements and tests each version on real Windows. He is not a programmer and has not
+reviewed the code line by line.
+
+That is the reason this document spends so much space on verification and testing. The
+design assumes the code may be wrong and makes it prove itself at run time: nothing is
+released until it has been read back from disk and compared. The test suite then tries to
+break that by killing the program everywhere it can. Independent review is welcome.
+
 ## The idea
 
 Compressing normally needs room for two copies at once: the files and the archive. If the

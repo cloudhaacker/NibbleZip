@@ -13,6 +13,25 @@ for the moment when a drive is too full to compress, or unpack, the things that 
 > is its purpose and it cannot be undone. Try it on copies first, and keep a backup of
 > anything you cannot afford to lose. See "No warranty" below.
 
+## Made with AI
+
+This should be clear up front: **all of NibbleZip's code was written by an AI**, Claude
+(made by Anthropic). So were the tests, the build scripts and this documentation.
+
+The project's author, cloudhaacker, had the idea (a tool that does what HatchZip does, in
+reverse), decided what it should do and how it should behave, and tests every version by
+hand on real Windows. He is not a programmer and did not write or review the code line by
+line.
+
+What that means for you:
+
+- Treat it as you would any new, unaudited tool that deletes files: try it on copies first.
+- The safety of the design does not rest on trusting the code by eye. Every step is verified
+  from disk before anything is deleted, and the test suite kills the program at every stage
+  of every kind of job to prove it recovers. Those tests are in this repository and run
+  automatically on every change.
+- The source is all here. Reviews, bug reports and criticism are very welcome.
+
 ## Download
 
 Get the latest `NibbleZip-x.y.zip` from the [Releases](../../releases) page, unzip it
@@ -168,6 +187,10 @@ To build it yourself you need Python with `pip install ziglang`, plus the 7-Zip 
 The tests need 7-Zip (`7zz` or `7z`) and `unzip` on the PATH.
 
 ## Credits
+
+Idea, direction and testing on real Windows: cloudhaacker. Code, tests and documentation:
+Claude, an AI model made by Anthropic, working from his requests. Commits carry a
+`Co-Authored-By: Claude` line for that reason.
 
 Inspired by [HatchZip](https://hatchzip.dev), which extracts archives while shrinking them.
 NibbleZip started as the reverse of that idea. Its own extraction works differently (front
