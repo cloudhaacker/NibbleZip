@@ -657,11 +657,22 @@ static void onDone() {
         return;
     }
     std::wstring t; UINT icon = MB_ICONINFORMATION;
-    std::wstring stats = std::to_wstring(r.final.filesDone) + L" file(s) stored in the archive.\nArchive size: " + W(nz::humanSize(r.final.packedBytes));
+    // "Original size -> archive size (N% smaller)", shown whether or not originals were deleted.
+    auto sizeLines = [&](const wchar_t* archiveLabel) {
+        std::wstring o; uint64_t orig = r.final.doneBytes, packed = r.final.packedBytes;
+        if (orig > 0) o += L"\nOriginal size: " + W(nz::humanSize(orig));
+        o += std::wstring(L"\n") + archiveLabel + W(nz::humanSize(packed));
+        if (orig > 0 && r.ok) {
+            if (packed < orig) { wchar_t pc[32]; _snwprintf(pc, 31, L"%.1f", 100.0 * (double)(orig - packed) / (double)orig); pc[31] = 0; o += std::wstring(L"  (") + pc + L"% smaller)"; }
+            else o += L"  (no smaller: these files were already compressed)";
+        }
+        return o;
+    };
+    std::wstring stats = std::to_wstring(r.final.filesDone) + L" file(s) stored in the archive." + sizeLines(L"Archive size: ");
     if (wasBatch) {
         stats = std::to_wstring(b.done) + L" of " + std::to_wstring(b.total) + L" archives were made";
         if (b.skipped) stats += L" (" + std::to_wstring(b.skipped) + L" skipped, see notes)";
-        stats += L".\nTotal size of the archives: " + W(nz::humanSize(r.final.packedBytes));
+        stats += L"." + sizeLines(L"Total size of the archives: ");
     }
     if (r.final.reclaimedBytes > 0) {
         stats += L"\nOriginals removed: " + W(nz::humanSize(r.final.reclaimedBytes));

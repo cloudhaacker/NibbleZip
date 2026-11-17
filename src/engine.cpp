@@ -979,6 +979,16 @@ Preflight preflight(const Options& opt) {
     plat::Stat st;
     if (!plat::stat(dir, st) || !st.isDir) { pf.error = "The archive folder does not exist: " + dir; return pf; }
     if (ArcFile::exists(archive)) { pf.error = "A file with that archive name already exists. Pick another name."; return pf; }
+    {   // Can we actually write here? (Windows blocks some places, such as C:\ itself or protected folders.)
+        std::string probe = plat::join(dir, ".nibblezip-write-test.tmp"); plat::File t;
+        plat::removeFile(probe);
+        if (!t.open(probe, plat::OpenRWCreateNew)) {
+            pf.error = "Windows would not let NibbleZip create files in " + dir + " (" + plat::lastError() + "). "
+                       "Choose a different folder for the archive. If Controlled folder access is on in Windows Security, allow NibbleZip there.";
+            return pf;
+        }
+        t.close(); plat::removeFile(probe);
+    }
     if (opt.split && opt.split < (1u << 20) && !opt.testStep) { pf.error = "Parts must be at least 1 MB."; return pf; }
     Plan plan; std::string err;
     if (!scan(opt.inputs, archive, plan, err, false)) { pf.error = err; return pf; }
