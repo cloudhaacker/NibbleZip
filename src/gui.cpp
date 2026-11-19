@@ -28,7 +28,7 @@
 
 static const wchar_t* kClass = L"NibbleZipMainWindow";
 static const wchar_t* kTitle = L"NibbleZip";
-static const wchar_t* kVersion = L"0.9.0";
+static const wchar_t* kVersion = L"0.9.1";
 static const DWORD kDisclaimerVersion = 2;   // raise to show the disclaimer again after its text changes
 static const wchar_t* kMenuText = L"Compress and reclaim space (NibbleZip)";
 #define WM_NZ_PROGRESS (WM_APP + 1)
@@ -93,6 +93,7 @@ struct App {
 static App g;
 
 static int S(int v) { return MulDiv(v, g.dpi, 96); }
+static std::wstring windowTitle() { return std::wstring(L"NibbleZip ") + kVersion; }
 static void showJobsWindow();
 static void refreshJobsButton();
 static std::wstring getText(HWND h) {
@@ -672,7 +673,7 @@ static void setRunningUI(bool on) {
     EnableWindow(g.pause, TRUE); EnableWindow(g.stop, TRUE);
     SetWindowTextW(g.pause, L"Pause");
     if (on) { SendMessageW(g.bar, PBM_SETPOS, 0, 0); SetWindowTextW(g.st1, L"Preparing…"); SetWindowTextW(g.st2, L""); }
-    else { g.verifying = false; g.batch = false; g.undoing = false; g.extracting = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); refreshJobsButton(); }
+    else { g.verifying = false; g.batch = false; g.undoing = false; g.extracting = false; SetWindowTextW(g.wnd, windowTitle().c_str()); updateInfo(); refreshJobsButton(); }
 }
 static void startVerify(const std::string& path) {
     if (g.worker.joinable()) g.worker.join();
@@ -875,7 +876,7 @@ static void onProgress() {
         s2 += L"   •   " + fmtTime((double)(p.totalBytes - p.doneBytes) / rate);
     }
     SetWindowTextW(g.st1, s1.c_str()); SetWindowTextW(g.st2, s2.c_str());
-    wchar_t title[64]; _snwprintf(title, 63, L"%d%% - NibbleZip", (int)(frac * 100)); title[63] = 0;
+    wchar_t title[64]; _snwprintf(title, 63, L"%d%% - NibbleZip %ls", (int)(frac * 100), kVersion); title[63] = 0;
     SetWindowTextW(g.wnd, title);
 }
 static void onDone() {
@@ -1553,7 +1554,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     RECT r = {0, 0, S(640), S(638)};
     AdjustWindowRectEx(&r, style, FALSE, WS_EX_ACCEPTFILES);
-    g.wnd = CreateWindowExW(WS_EX_ACCEPTFILES, kClass, kTitle, style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
+    g.wnd = CreateWindowExW(WS_EX_ACCEPTFILES, kClass, windowTitle().c_str(), style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     if (!g.wnd) return 1;
     darkTitleBar(g.wnd);
     createControls();

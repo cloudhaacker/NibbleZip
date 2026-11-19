@@ -62,6 +62,11 @@ int main(int argc, char** argv) {
             if (w) SetWindowPos(w, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             continue;
         }
+        if (!strcmp(argv[i], "title")) {
+            HWND w = FindWindowW(L"NibbleZipMainWindow", 0); wchar_t t[256] = {0}; if (w) GetWindowTextW(w, t, 255);
+            char u[1024]; WideCharToMultiByte(CP_UTF8, 0, t, -1, u, 1023, 0, 0); printf("TITLE %s\n", u); fflush(stdout);
+            continue;
+        }
         if (!strcmp(argv[i], "status")) {
             HWND w = FindWindowW(L"NibbleZipMainWindow", 0); if (!w) { printf("no main window\n"); continue; }
             printf("main window:\n"); EnumChildWindows(w, dumpChild, 0); fflush(stdout);

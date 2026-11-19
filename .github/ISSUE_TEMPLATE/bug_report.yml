@@ -1,0 +1,68 @@
+name: Bug report
+description: Something went wrong, or NibbleZip did something you did not expect
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing NibbleZip. If you think data may have been lost, please stop using it on that
+        drive, leave the archive and any `.nzj` / `.nzx` files exactly where they are, and say so below:
+        the journal files often make it possible to recover.
+  - type: input
+    id: version
+    attributes:
+      label: NibbleZip version
+      description: Shown in the title bar, or in More > About.
+      placeholder: "0.9.1"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: dropdown
+    id: task
+    attributes:
+      label: What were you doing?
+      options:
+        - Compressing, deleting the originals
+        - Compressing, keeping the originals
+        - Extracting, deleting the archive
+        - Extracting, keeping the archive
+        - Resuming or undoing an unfinished job
+        - Checking an archive
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: drive
+    attributes:
+      label: Drive and file system
+      description: For example internal SSD with NTFS, USB stick with exFAT, network drive.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Include the exact wording of any message NibbleZip showed. Screenshots help.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to make it happen again
+      description: Roughly how many files, how big, which format, which options (split parts, one archive per file, and so on).
+  - type: dropdown
+    id: dataloss
+    attributes:
+      label: Was any data lost or damaged?
+      options:
+        - "No"
+        - "Not sure"
+        - "Yes"
+    validations:
+      required: true

@@ -54,6 +54,11 @@ While it runs you can pause, or stop and pick the job up again later.
 
 ![A job in progress](docs/images/progress.png)
 
+Stopping asks whether to stop at once or finish the file in progress first. Either way,
+everything already stored is safe.
+
+![Stopping a job](docs/images/stop.png)
+
 ![The finish message](docs/images/done.png)
 
 Untick "Delete each original..." to use it as an ordinary archiver. That is the best way
@@ -174,6 +179,8 @@ The software is provided "as is", without warranty of any kind. The authors and
 contributors are **not responsible or liable for any loss of data** or any other damage
 arising from its use. See [LICENSE.txt](LICENSE.txt) for the full terms. The app asks you
 to accept this the first time it runs, and again whenever those terms change.
+
+![The notice shown on first start](docs/images/disclaimer.png)
 
 ## Building
 
