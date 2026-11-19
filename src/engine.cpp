@@ -896,6 +896,35 @@ void discardStaleJournal(const std::string& archive0) {
     if (ArcFile::exists(archive)) return;
     plat::removeFile(journalPathFor(archive)); plat::removeFile(mirrorPathFor(archive));
 }
+static bool pathOverlap(const std::string& a, const std::string& b) {
+    std::string ka = plat::pathKey(a), kb = plat::pathKey(b);
+    auto under = [](const std::string& child, const std::string& par) {
+        return child.size() > par.size() && child.compare(0, par.size(), par) == 0 &&
+               (child[par.size()] == '/' || child[par.size()] == '\\' || par.back() == '/' || par.back() == '\\');
+    };
+    return ka == kb || under(ka, kb) || under(kb, ka) || ArcFile::isPartOf(ka, kb) || ArcFile::isPartOf(kb, ka);
+}
+std::string claimConflict(const std::vector<std::string>& paths, const std::string& ownArchive) {
+    for (auto& ji : pendingJobs()) {
+        if (!ownArchive.empty() && plat::samePath(ji.archive, ownArchive)) continue;
+        std::vector<std::string> claims = ji.opt.inputs;
+        claims.push_back(ji.archive); claims.push_back(journalPathFor(ji.archive));
+        for (auto& p : paths) for (auto& c : claims)
+            if (pathOverlap(p, c))
+                return "\"" + plat::baseName(p) + "\" is part of an unfinished compression job (archive " + ji.archive +
+                       "), which is not finished yet. Resume, undo or close that job first, using Unfinished jobs.";
+    }
+    for (auto& xi : pendingExtractions()) {
+        if (!ownArchive.empty() && plat::samePath(xi.archive, ownArchive)) continue;
+        std::vector<std::string> claims; claims.push_back(xi.archive); claims.push_back(xi.dest);
+        for (auto& p : paths) for (auto& c : claims)
+            if (pathOverlap(p, c))
+                return "\"" + plat::baseName(p) + "\" is part of an unfinished extraction (" + xi.archive + " into " + xi.dest +
+                       "). Its files are not complete yet. Finish that extraction first, using Unfinished jobs.";
+    }
+    return "";
+}
+
 bool archiveExists(const std::string& archive) { return ArcFile::exists(plat::absPath(archive)); }
 std::string deletionLogPath() { return plat::join(plat::appDataDir(), "deleted-files.log"); }
 
@@ -958,6 +987,13 @@ Preflight preflight(const Options& opt) {
         }
         for (auto& xi : pendingExtractions())
             if (inSelection(xi.archive)) { pf.error = "The selection contains an archive that is part-way through being extracted (" + xi.archive + "). Finish that extraction first, using Unfinished jobs."; return pf; }
+    }
+    {
+        std::vector<std::string> mine;
+        for (auto& in : opt.inputs) mine.push_back(plat::absPath(in));
+        mine.push_back(archive);
+        std::string clash = claimConflict(mine, archive);
+        if (!clash.empty()) { pf.error = clash; return pf; }
     }
     pf.totalBytes = plan.total; pf.files = plan.files.size(); pf.dirs = plan.dirs.size(); pf.largest = plan.largest;
     for (auto& s : plan.skipped) if (pf.notes.size() < 20) pf.notes.push_back(s);

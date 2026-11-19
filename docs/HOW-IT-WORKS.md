@@ -272,6 +272,24 @@ Names from an archive are never trusted. Drive letters, absolute paths, `..`, re
 device names and characters Windows cannot store are rewritten, so no entry can be written
 outside the destination folder. Duplicate names get a numbered suffix.
 
+## Jobs never interfere with each other
+
+A stopped job is not a finished one. A compression job may be half-way through a file whose
+front is already released; an extraction may be half-way through writing a file whose
+source is already released from the archive. If another job took in either of those, it
+could archive or delete the only copy of something.
+
+So every unfinished job keeps a claim on what it works on:
+
+- a compression job: its inputs (files and folders), its archive and parts, and its journal;
+- an extraction job: its archive and parts, and the folder it is extracting into.
+
+Before any new job starts, every path it would read or write is compared with those claims.
+Overlap in either direction counts: the same path, a path inside a claimed folder, or a
+folder that contains a claimed path. Any overlap refuses the new job before it changes
+anything, with a message naming the job that holds the claim. The claims are read from the
+journals, so they hold across restarts.
+
 ## The checker
 
 "Check an archive" opens a finished 7z or ZIP from disk (including split ones), streams
@@ -302,6 +320,10 @@ testing and on Windows for real.
   must be refused (encrypted, unsupported methods, damaged, not an archive) are checked to
   be left byte-for-byte untouched, and a ZIP full of hostile names must stay inside its
   destination folder.
+- **Claims** are tested in both directions: with an extraction stopped half-way, compressing
+  its folder, a file inside it, a folder containing it, or extracting something else into it
+  must all be refused and leave it untouched; the same for a stopped compression job; then
+  both jobs must still finish with correct results.
 - **Large files.** A separate test compresses files over 4 GB, checks ZIP64, and measures
   peak disk use to confirm that space really is released as the job runs.
 - **Damage.** Flipped bytes and missing parts must be caught by the checker.

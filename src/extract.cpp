@@ -725,10 +725,10 @@ static std::string stripArchiveExt(const std::string& name) {
 
 } // namespace
 
-std::string defaultExtractDest(const std::string& archive0) {
+std::string defaultExtractDest(const std::string& archive0, const std::string& parent) {
     std::string picked = plat::absPath(archive0), base; uint64_t ps = 0;
     ArcFile::detect(picked, base, ps);
-    std::string dir = plat::parentDir(base), stem = stripArchiveExt(plat::baseName(base));
+    std::string dir = parent.empty() ? plat::parentDir(base) : plat::absPath(parent), stem = stripArchiveExt(plat::baseName(base));
     std::string cand = plat::join(dir, stem); plat::Stat st;
     for (int i = 2; i < 1000 && plat::stat(cand, st); i++) cand = plat::join(dir, stem + " (" + std::to_string(i) + ")");
     return cand;
@@ -805,6 +805,9 @@ ExtractResult extractArchive(const ExtractOptions& opt, Callbacks& cb) {
         c.h = XHeader(); c.h.archive = base; c.h.partSize = partSize; c.h.eat = opt.eat;
         if (!ArcFile::totalSizeOf(base, partSize, c.h.totalSize) || c.h.totalSize < 22) { c.fail("Cannot read the archive: " + base, false); return finish(); }
         c.h.dest = opt.dest.empty() ? defaultExtractDest(base) : plat::absPath(opt.dest);
+        std::vector<std::string> mine; mine.push_back(base); mine.push_back(c.h.dest);
+        std::string clash = claimConflict(mine, base);
+        if (!clash.empty()) { c.fail(clash, false); return finish(); }
     } else c.st = std::move(loaded);
     c.pr.packedBytes = c.h.totalSize;
     if (!c.arc.openForExtract(c.h.archive, c.h.partSize, c.h.totalSize, c.h.eat)) {

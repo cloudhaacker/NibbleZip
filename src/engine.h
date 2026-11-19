@@ -107,7 +107,12 @@ std::vector<ExtractInfo> pendingExtractions();
 bool loadExtraction(const std::string& archive, ExtractInfo& info);
 // Drops an unfinished "extract only" job (the archive was never changed). Refuses for space-reclaiming jobs.
 bool forgetExtraction(const std::string& archive);
-std::string defaultExtractDest(const std::string& archive);
+// A new folder for an archive's files: next to the archive, or inside `parent` when given. Never an existing name.
+std::string defaultExtractDest(const std::string& archive, const std::string& parent = "");
+// Every unfinished job (stopped or not) claims what it works on: a compression job its inputs, archive and
+// journal; an extraction its archive and destination folder. Returns a message if any of `paths` overlaps
+// such a claim (the same path, inside it, or containing it), or "" if they are free. `ownArchive` is ignored.
+std::string claimConflict(const std::vector<std::string>& paths, const std::string& ownArchive);
 
 Preflight preflight(const Options& opt);
 // Reads a finished 7z or ZIP archive from disk, decompresses every file and checks it against its stored checksum.

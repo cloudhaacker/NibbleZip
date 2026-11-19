@@ -45,7 +45,7 @@ code-signed: choose **More info > Run anyway**.
 
 1. Drag files or folders into the window, or use **Add files / Add folder**.
 2. Pick 7z (smallest) or ZIP (opens everywhere) and a compression level.
-3. Press **Start** and read the confirmation. It tells you what will be deleted, how much
+3. Make sure **Compress** is selected at the top, press **Start** and read the confirmation. It tells you what will be deleted, how much
    free space is needed and roughly how big the archive will be.
 
 ![Confirmation with the size estimate](docs/images/confirm.png)
@@ -65,22 +65,28 @@ as you like; they all arrive in one window.
 
 ## Extracting
 
-Press **Extract...** and choose one or more `.7z` or `.zip` archives (for a split archive,
-choose its `.001` part), or right-click archives in Explorer and choose "Extract and reclaim
-space (NibbleZip)". Any number of archives can be selected at once.
+The **Compress / Extract** switch at the top of the window chooses what Start does. The
+window always opens in Compress. If you drop or pick only archives into an empty list, it
+switches to Extract by itself and says so; choose Compress to pack them into a new archive
+instead. In Extract mode, adding a folder adds every archive inside it. You can also
+right-click archives in Explorer and choose "Extract and reclaim space (NibbleZip)", which
+opens them in the window ready to extract. Any number of archives can be extracted in one go.
 
-![Choosing how to extract](docs/images/extract-ask.png)
+![Extract mode](docs/images/extract-mode.png)
 
-- **Extract and reclaim space.** The whole archive is decompressed and checked against its
-  checksums first, and nothing is touched if that fails. Then its files are written out, and
-  as each stretch of them is verified on disk, the part of the archive they came from is
-  released. When everything is out and verified, what is left of the archive is removed.
-- **Extract only** leaves the archive exactly as it was.
+- **Delete each archive as its files are extracted** (ticked by default). The whole archive
+  is decompressed and checked against its checksums first, and nothing is touched if that
+  fails. Then its files are written out, and as each stretch of them is verified on disk,
+  the part of the archive they came from is released. When everything is out and verified,
+  what is left of the archive is removed.
+- **Untick it** to extract only and leave the archive exactly as it was.
 
-Files go into a new folder next to the archive, named after it. Stop, a crash or a power cut
-can be resumed just like compression.
+Each archive's files go into a new folder named after it, next to the archive or inside a
+folder you pick. If one archive in a batch cannot be extracted (for example it is
+password-protected), it is left untouched and the rest carry on. Stop, a crash or a power
+cut can be resumed just like compression.
 
-![Extracting while the archive shrinks](docs/images/extract-progress.png)
+![Confirming an extraction](docs/images/extract-confirm.png)
 
 It reads 7z archives that use LZMA2, LZMA or no compression (including 7-Zip's filter for
 programs), and ZIP archives that use Deflate or no compression. Anything else, such as
@@ -109,8 +115,9 @@ is not supported.
   **Unfinished jobs** button lists every compression and extraction that was stopped before
   it finished, and opens by itself when NibbleZip starts. From there you can resume a job,
   put a half-processed file back, close an archive as it is, or (for an "extract only" job)
-  forget it. A file that belongs to an unfinished job cannot be taken into a new job until
-  that job is finished.
+  forget it. An unfinished job keeps a claim on everything it works on (its files and
+  folders, its archive, and for an extraction the folder it is extracting into), and no new
+  job may touch any of that until the job is finished.
 
   ![The Unfinished jobs list](docs/images/unfinished-jobs.png)
 

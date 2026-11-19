@@ -175,6 +175,34 @@ def main():
         expect_tree(d + "/pack", ROOT + "/ref/" + src + "/pack", "same-name " + src)
         assert sorted(os.listdir(d)) == ["pack"], os.listdir(d)
     print("archive named after its single top folder is not nested twice OK", flush=True)
+    # unfinished jobs claim what they work on: nothing else may touch it until they are finished
+    a = stage(arcs["nz-7z"], "claims"); wd = os.path.dirname(a); dest = dest_of(a)
+    rc, err = run(["extract", a, "--quiet", "--interval", IV, "--no-precheck", "--pause-after", "2000000"]); assert rc == 3, (rc, err)
+    snap = tree(dest)
+    for args in (["pack", "-o", wd + "/x1.7z", dest],                                # the folder being extracted into
+                 ["pack", "-o", wd + "/x2.7z", dest + "/pack/big_text.dat"],         # a file inside it
+                 ["pack", "-o", ROOT + "/work/x3.7z", wd],                           # a folder that contains the job
+                 ["pack", "--each", "file", "-o", "-", dest]):                       # one archive per file inside it
+        rc, err = run(args + ["--quiet"])
+        assert "unfinished extraction" in err or "unfinished NibbleZip job" in err, (args, rc, err)
+    other = stage(arcs["zip-7zip"], "claims-other")
+    rc, err = run(["extract", other, "--quiet", "--dest", dest + "/inner"]); assert rc == 1 and "unfinished extraction" in err, err
+    assert tree(dest) == snap, "the partly extracted folder was changed"
+    # and the other way round: a stopped compression job claims its inputs
+    src = ROOT + "/work/claims-comp"; shutil.rmtree(src, ignore_errors=True); shutil.copytree(ROOT + "/data/pack", src + "/stuff")
+    shutil.copy2(arcs["zip-7zip"], src + "/stuff/inside.zip")
+    rc, err = run(["pack", "--quiet", "--step", "262144", "--pause-after", "1500000", "-o", src + "/stuff.7z", src + "/stuff"]); assert rc == 3, (rc, err)
+    rc, err = run(["extract", src + "/stuff/inside.zip", "--quiet"]); assert rc == 1 and "unfinished compression job" in err, err
+    rc, err = run(["extract", other, "--quiet", "--dest", src + "/stuff/out"]); assert rc == 1 and "unfinished compression job" in err, err
+    # both jobs can still be finished, with the right results
+    rc, err = run(["extract", a, "--quiet", "--interval", IV]); assert rc == 0, err
+    expect_tree(dest, ROOT + "/ref/nz-7z", "claims extraction")
+    rc, err = run(["resume", src + "/stuff.7z", "--quiet", "--step", "262144"]); assert rc == 0, err
+    assert not os.path.exists(src + "/stuff")
+    rc, err = run(["verify", src + "/stuff.7z", "--quiet"]); assert rc == 0, err
+    print("unfinished jobs keep other jobs away from their files OK", flush=True)
+    shutil.rmtree(ROOT + "/work", ignore_errors=True)
+
     # archives it must refuse, without touching them
     data = ROOT + "/data"; A = ROOT + "/arcs"; bad = {}
     def mk(name, *sw, ext="7z"):
