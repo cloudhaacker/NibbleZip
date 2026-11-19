@@ -150,9 +150,16 @@ struct Plan {
     std::vector<PlanFile> dirs;
     std::vector<std::string> skipped;
     uint64_t total = 0, largest = 0;
+    std::vector<std::string> jobFiles;   // journals of other unfinished jobs found among the inputs
 };
 
 static std::string g_scanArchiveKey;   // parts of the archive being written are never treated as input
+static bool isJobFile(const std::string& name) {
+    if (name.size() < 4) return false;
+    std::string e = name.substr(name.size() - 4);
+    for (auto& ch : e) if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+    return e == ".nzj" || e == ".nzx";
+}
 static bool excluded(const std::set<std::string>& exclude, const std::string& p) {
     std::string k = plat::pathKey(p);
     return exclude.count(k) || (!g_scanArchiveKey.empty() && ArcFile::isPartOf(k, g_scanArchiveKey));
@@ -169,6 +176,7 @@ static void scanDir(const std::string& dir, const std::string& rel, const std::s
             scanDir(p, r, exclude, plan);
         } else {
             if (excluded(exclude, p)) continue;
+            if (isJobFile(e.name)) { plan.jobFiles.push_back(p); continue; }
             PlanFile f; f.src = p; f.rel = r; f.size = e.st.size; f.mtime = e.st.mtime; f.attr = e.st.attr;
             plan.total += f.size; plan.largest = std::max(plan.largest, f.size);
             plan.files.push_back(std::move(f));
@@ -199,6 +207,7 @@ static bool scan(const std::vector<std::string>& inputs, const std::string& arch
             scanDir(in, name, exclude, plan);
         } else {
             if (excluded(exclude, in)) continue;
+            if (isJobFile(name)) { plan.jobFiles.push_back(in); continue; }
             PlanFile f; f.src = in; f.rel = name; f.size = st.size; f.mtime = st.mtime; f.attr = st.attr;
             plan.total += f.size; plan.largest = std::max(plan.largest, f.size);
             plan.files.push_back(std::move(f));
@@ -922,6 +931,34 @@ Preflight preflight(const Options& opt) {
     if (opt.split && opt.split < (1u << 20) && !opt.testStep) { pf.error = "Parts must be at least 1 MB."; return pf; }
     Plan plan; std::string err;
     if (!scan(opt.inputs, archive, plan, err, false)) { pf.error = err; return pf; }
+    // Never take in anything that belongs to another unfinished job. A file that job is half-way through is
+    // already partly hollowed out, and an unfinished archive or journal is still needed to finish that job.
+    if (!plan.jobFiles.empty()) {
+        pf.error = "The selection contains an unfinished NibbleZip job (" + plat::baseName(plan.jobFiles[0]) + " in " + plat::parentDir(plan.jobFiles[0]) +
+                   "). Finish, undo or close that job first, using Unfinished jobs.";
+        return pf;
+    }
+    {
+        std::set<std::string> keys;
+        for (auto& f : plan.files) keys.insert(plat::pathKey(f.src));
+        auto inSelection = [&](const std::string& arc) {
+            std::string ak = plat::pathKey(arc);
+            if (keys.count(ak)) return true;
+            for (auto& k : keys) if (ArcFile::isPartOf(k, ak)) return true;
+            return false;
+        };
+        for (auto& ji : pendingJobs()) {
+            if (plat::samePath(ji.archive, archive)) continue;
+            if (ji.midFile && keys.count(plat::pathKey(ji.midFileSrc))) {
+                pf.error = "\"" + plat::baseName(ji.midFileSrc) + "\" is half-way through another unfinished job (" + ji.archive +
+                           "). Part of it is only in that archive. Resume or undo that job first, using Unfinished jobs.";
+                return pf;
+            }
+            if (inSelection(ji.archive)) { pf.error = "The selection contains the archive of an unfinished job (" + ji.archive + "). Finish or close that job first, using Unfinished jobs."; return pf; }
+        }
+        for (auto& xi : pendingExtractions())
+            if (inSelection(xi.archive)) { pf.error = "The selection contains an archive that is part-way through being extracted (" + xi.archive + "). Finish that extraction first, using Unfinished jobs."; return pf; }
+    }
     pf.totalBytes = plan.total; pf.files = plan.files.size(); pf.dirs = plan.dirs.size(); pf.largest = plan.largest;
     for (auto& s : plan.skipped) if (pf.notes.size() < 20) pf.notes.push_back(s);
     if (plan.files.empty() && plan.dirs.empty()) { pf.error = "Nothing to compress."; return pf; }
@@ -966,7 +1003,7 @@ bool loadJob(const std::string& archive0, JobInfo& info) {
     if (!loadJournal(archive, h, st, bytes)) return false;
     info = JobInfo();
     info.archive = archive; info.opt.archive = archive; info.opt.format = h.format; info.opt.level = h.level; info.opt.eat = h.eat; info.opt.inputs = h.inputs; info.opt.split = h.split;
-    info.midFile = st.part.active; info.midFileName = st.part.e.rel; info.filesDone = st.entries.size(); info.packedBytes = st.dataEnd;
+    info.midFile = st.part.active; info.midFileName = st.part.e.rel; info.midFileSrc = st.part.e.src; info.filesDone = st.entries.size(); info.packedBytes = st.dataEnd;
     return true;
 }
 

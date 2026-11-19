@@ -273,6 +273,22 @@ def main():
                 assert src_gone(d); verify(arc, fmt, ROOT + "/orig")
             n += 1; cnt += 1
         print(fmt, "undo OK (plain and split, archive kept and removed, %d crash scenarios)" % cnt, flush=True)
+    # 7g. nothing that belongs to an unfinished job may be taken into another job
+    for fmt in ("7z", "zip"):
+        d = fresh("guard_" + fmt); arc = d + "/out." + fmt
+        pause_at(d, fmt, 900000)
+        rc, err = run(["pack", "-f", fmt, "--quiet", "--step", str(step), "-o", d + "/other." + fmt, d + "/src/game"])
+        assert rc == 1 and "half-way" in err, (rc, err)
+        assert not os.path.exists(d + "/other." + fmt) and not os.path.exists(d + "/other." + fmt + ".nzj")
+        os.makedirs(d + "/perfile")
+        rc, err = run(["pack", "--each", "file", "--keep", "--outdir", d + "/perfile", "-f", "zip" if fmt == "7z" else "7z", "--quiet", "--step", str(step), d + "/src/game"])
+        assert "half-way" in err, (rc, err)
+        rc, err = run(["pack", "-f", fmt, "--quiet", "--step", str(step), "-o", d + "/../parent_" + fmt + "." + fmt, d])
+        assert rc == 1 and "unfinished NibbleZip job" in err, (rc, err)
+        rc, err = run(["extract", arc, "--quiet"]); assert rc == 1 and "unfinished compression job" in err, (rc, err)
+        rc, err = run(["resume", arc, "--quiet", "--step", str(step)]); assert rc == 0, err
+        assert src_gone(d); verify(arc, fmt, ROOT + "/orig")
+        print(fmt, "files of an unfinished job are refused by other jobs OK", flush=True)
     # 7e. size estimate is in the right region
     for fmt in ("7z", "zip"):
         d = fresh("est_" + fmt)

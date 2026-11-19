@@ -105,16 +105,20 @@ is not supported.
 - **Already-compressed data** (video, music, zips, most game archives) is detected by
   sampling and stored as it is instead of being recompressed, which is many times faster
   for almost no size difference.
-- **Stop and resume.** After a stop, a crash or a power cut, NibbleZip offers on its next
-  start to continue exactly where it left off.
+- **Stop and resume.** After a stop, a crash or a power cut, nothing is lost. The
+  **Unfinished jobs** button lists every compression and extraction that was stopped before
+  it finished, and opens by itself when NibbleZip starts. From there you can resume a job,
+  put a half-processed file back, close an archive as it is, or (for an "extract only" job)
+  forget it. A file that belongs to an unfinished job cannot be taken into a new job until
+  that job is finished.
 
-  ![Resuming an unfinished job](docs/images/resume.png)
+  ![The Unfinished jobs list](docs/images/unfinished-jobs.png)
 
 - **Undo for a half-finished big file.** If a job was stopped part-way through a large
   file, you can instead put that file back exactly as it was and close the archive.
-- **Deletion log** opens a plain text list of every original NibbleZip has removed, with
-  the date, size and the archive it went into.
-- **Theme** switches between following Windows, light and dark.
+- **More** holds the **Deletion log** (a plain text list of every original NibbleZip has
+  removed, with the date, size and the archive it went into), the **Theme** (follow Windows,
+  light or dark) and **About**.
 
 ## How it stays safe
 
@@ -162,7 +166,7 @@ tested, is in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 The software is provided "as is", without warranty of any kind. The authors and
 contributors are **not responsible or liable for any loss of data** or any other damage
 arising from its use. See [LICENSE.txt](LICENSE.txt) for the full terms. The app asks you
-to accept this the first time it runs.
+to accept this the first time it runs, and again whenever those terms change.
 
 ## Building
 

@@ -58,7 +58,7 @@ struct JobInfo {
     std::string archive;
     Options opt;
     bool midFile = false;
-    std::string midFileName;
+    std::string midFileName, midFileSrc;
     uint64_t filesDone = 0, packedBytes = 0;
 };
 
@@ -105,6 +105,8 @@ struct ExtractInfo { std::string archive, dest; bool eat = true; };
 ExtractResult extractArchive(const ExtractOptions& opt, Callbacks& cb);
 std::vector<ExtractInfo> pendingExtractions();
 bool loadExtraction(const std::string& archive, ExtractInfo& info);
+// Drops an unfinished "extract only" job (the archive was never changed). Refuses for space-reclaiming jobs.
+bool forgetExtraction(const std::string& archive);
 std::string defaultExtractDest(const std::string& archive);
 
 Preflight preflight(const Options& opt);

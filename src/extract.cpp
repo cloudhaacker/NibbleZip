@@ -744,6 +744,13 @@ bool loadExtraction(const std::string& archive0, ExtractInfo& info) {
     return true;
 }
 
+bool forgetExtraction(const std::string& archive0) {
+    ExtractInfo xi;
+    if (!loadExtraction(archive0, xi) || xi.eat) return false;
+    plat::removeFile(xi.archive + XEXT); plat::removeFile(mirrorPathFor(xi.archive, XEXT));
+    return true;
+}
+
 std::vector<ExtractInfo> pendingExtractions() {
     crcInit();
     std::vector<ExtractInfo> out; std::vector<plat::DirEnt> ents;
@@ -790,6 +797,11 @@ ExtractResult extractArchive(const ExtractOptions& opt, Callbacks& cb) {
     if (!resume) {
         if (!ArcFile::exists(base)) { c.fail("Archive not found: " + base, false); return finish(); }
         if (plat::stat(journalPathFor(base), st)) { c.fail("This archive belongs to an unfinished compression job. Resume or close that job first.", false); return finish(); }
+        for (auto& ji : pendingJobs())
+            if (ji.midFile && (plat::samePath(ji.midFileSrc, base) || plat::samePath(ji.midFileSrc, picked))) {
+                c.fail("This archive is half-way through being compressed by another job (" + ji.archive + "), so part of it is missing. Resume or undo that job first.", false);
+                return finish();
+            }
         c.h = XHeader(); c.h.archive = base; c.h.partSize = partSize; c.h.eat = opt.eat;
         if (!ArcFile::totalSizeOf(base, partSize, c.h.totalSize) || c.h.totalSize < 22) { c.fail("Cannot read the archive: " + base, false); return finish(); }
         c.h.dest = opt.dest.empty() ? defaultExtractDest(base) : plat::absPath(opt.dest);

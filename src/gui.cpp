@@ -26,6 +26,8 @@
 
 static const wchar_t* kClass = L"NibbleZipMainWindow";
 static const wchar_t* kTitle = L"NibbleZip";
+static const wchar_t* kVersion = L"0.8.0";
+static const DWORD kDisclaimerVersion = 2;   // raise to show the disclaimer again after its text changes
 static const wchar_t* kMenuText = L"Compress and reclaim space (NibbleZip)";
 #define WM_NZ_PROGRESS (WM_APP + 1)
 #define WM_NZ_DONE (WM_APP + 2)
@@ -33,7 +35,7 @@ static const wchar_t* kMenuText = L"Compress and reclaim space (NibbleZip)";
 #define NZ_COPYDATA_EXTRACT 0x4E5A0002
 
 enum { ID_LIST = 100, ID_ADDFILES, ID_ADDFOLDER, ID_REMOVE, ID_CLEAR, ID_ARCHIVE, ID_BROWSE, ID_FORMAT, ID_LEVEL, ID_EAT,
-       ID_START, ID_PAUSE, ID_STOP, ID_MENU, ID_VERIFY, ID_THEME, ID_EATLABEL, ID_OUTPUT, ID_LOG, ID_SPLIT, ID_EXTRACT };
+       ID_START, ID_PAUSE, ID_STOP, ID_MENU, ID_VERIFY, ID_THEME, ID_EATLABEL, ID_OUTPUT, ID_LOG, ID_SPLIT, ID_EXTRACT, ID_JOBS, ID_MORE, ID_ABOUT, ID_THEME_AUTO, ID_THEME_LIGHT, ID_THEME_DARK };
 
 static std::wstring W(const std::string& s) {
     if (s.empty()) return std::wstring();
@@ -55,7 +57,7 @@ struct App {
     HWND wnd = nullptr, list = nullptr, archive = nullptr, format = nullptr, level = nullptr, eat = nullptr, info = nullptr,
          bar = nullptr, st1 = nullptr, st2 = nullptr, start = nullptr, pause = nullptr, stop = nullptr, menuBtn = nullptr,
          addFiles = nullptr, addFolder = nullptr, removeBtn = nullptr, clearBtn = nullptr, browse = nullptr,
-         eatLabel = nullptr, verifyBtn = nullptr, themeBtn = nullptr, output = nullptr, saveLabel = nullptr, logBtn = nullptr, split = nullptr, extractBtn = nullptr;
+         eatLabel = nullptr, verifyBtn = nullptr, themeBtn = nullptr, output = nullptr, saveLabel = nullptr, logBtn = nullptr, split = nullptr, extractBtn = nullptr, jobsBtn = nullptr, moreBtn = nullptr;
     HFONT font = nullptr, fontBig = nullptr;
     int dpi = 96;
     std::vector<std::string> items;
@@ -83,6 +85,8 @@ struct App {
 static App g;
 
 static int S(int v) { return MulDiv(v, g.dpi, 96); }
+static void showJobsWindow();
+static void refreshJobsButton();
 static std::wstring getText(HWND h) {
     int n = GetWindowTextLengthW(h);
     std::wstring s(n + 1, 0);
@@ -205,7 +209,6 @@ static void darkTitleBar(HWND h) {
     BOOL on = TRUE;
     if (f && FAILED(f(h, 20, &on, sizeof(on)))) f(h, 19, &on, sizeof(on));
 }
-static const wchar_t* themeLabel() { return T.pref == 1 ? L"Theme: Light" : T.pref == 2 ? L"Theme: Dark" : L"Theme: Auto"; }
 
 // Message box that follows the dark theme. In light mode the normal Windows message box is used.
 static const wchar_t* kBoxClass = L"NibbleZipBox";
@@ -321,17 +324,30 @@ static int themedBox(HWND owner, const std::wstring& text, const wchar_t* title,
 }
 
 static bool acceptDisclaimer() {
-    if (regGet(L"DisclaimerAccepted", 0) == 1) return true;
+    if (regGet(L"DisclaimerAccepted", 0) >= kDisclaimerVersion) return true;
     int r = themedBox(nullptr,
-        L"NibbleZip permanently deletes your original files as it compresses them. That is its purpose, and it cannot be undone.\n\n"
+        L"NibbleZip permanently deletes your original files as it compresses them, and can delete archives as it extracts them. "
+        L"That is its purpose, and it cannot be undone.\n\n"
+        L"NibbleZip was written by an AI. Its code, tests and documentation were written by Claude, an AI model made by Anthropic, "
+        L"for its author, who designed it and tests it. It is heavily tested, but no human programmer has reviewed the code line by line.\n\n"
         L"This software is provided \"as is\", without warranty of any kind. The authors and contributors are not responsible or liable "
         L"for any loss of data or any other damage arising from its use. You use it entirely at your own risk.\n\n"
         L"Keep a backup of anything you cannot afford to lose.\n\n"
         L"Press OK to accept these terms and continue, or Cancel to exit.",
-        L"NibbleZip – please read", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
+        L"NibbleZip \u2013 please read", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
     if (r != IDOK) return false;
-    regSet(L"DisclaimerAccepted", 1);
+    regSet(L"DisclaimerAccepted", kDisclaimerVersion);
     return true;
+}
+static void showAbout() {
+    std::wstring t = std::wstring(L"NibbleZip ") + kVersion + L"\nCompress in place. Verify, then delete.\n\n"
+        L"Idea, design and testing: cloudhaacker.\n"
+        L"Code, tests and documentation: written by Claude, an AI model made by Anthropic.\n\n"
+        L"Free software under the MIT licence, with no warranty (see LICENSE.txt).\n"
+        L"Compression: LZMA SDK by Igor Pavlov (public domain) and zlib by Jean-loup Gailly and Mark Adler.\n\n"
+        L"Source code, bug reports and how it works:\ngithub.com/cloudhaacker/NibbleZip\n\nOpen the project page now?";
+    if (themedBox(g.wnd, t, L"About NibbleZip", MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2) == IDYES)
+        ShellExecuteW(g.wnd, L"open", L"https://github.com/cloudhaacker/NibbleZip", nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 // ---------------------------------------------------------------- right-click menu
@@ -533,7 +549,7 @@ static void formatChanged() {
 // ---------------------------------------------------------------- running a job
 static void setRunningUI(bool on) {
     g.running = on;
-    HWND inputs[] = {g.output, g.logBtn, g.extractBtn, g.split, g.archive, g.format, g.level, g.eat, g.eatLabel, g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.verifyBtn, g.themeBtn};
+    HWND inputs[] = {g.output, g.jobsBtn, g.moreBtn, g.extractBtn, g.split, g.archive, g.format, g.level, g.eat, g.eatLabel, g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.verifyBtn};
     for (HWND h : inputs) EnableWindow(h, !on);
     ShowWindow(g.start, on ? SW_HIDE : SW_SHOW);
     ShowWindow(g.pause, on ? SW_SHOW : SW_HIDE);
@@ -545,7 +561,7 @@ static void setRunningUI(bool on) {
     EnableWindow(g.pause, TRUE); EnableWindow(g.stop, TRUE);
     SetWindowTextW(g.pause, L"Pause");
     if (on) { SendMessageW(g.bar, PBM_SETPOS, 0, 0); SetWindowTextW(g.st1, L"Preparing…"); SetWindowTextW(g.st2, L""); }
-    else { g.verifying = false; g.batch = false; g.undoing = false; g.extracting = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); }
+    else { g.verifying = false; g.batch = false; g.undoing = false; g.extracting = false; SetWindowTextW(g.wnd, kTitle); updateInfo(); refreshJobsButton(); }
 }
 static void startVerify(const std::string& path) {
     if (g.worker.joinable()) g.worker.join();
@@ -932,16 +948,8 @@ static void onStop() {
     else if (r == IDNO) { g.stopReq = 2; g.pauseFlag = false; EnableWindow(g.stop, FALSE); }
 }
 static void onStartup() {
-    std::vector<nz::JobInfo> jobs = nz::pendingJobs();
-    for (auto& j : jobs) { if (g.running) break; offerResume(j); }
-    if (g.running) return;
-    for (auto& x : nz::pendingExtractions()) {
-        if (g.running) break;
-        std::wstring t = L"An unfinished extraction was found:\n\n" + W(x.archive) + L"\n\nSome of its files are already in:\n" + W(x.dest) +
-                         (x.eat ? L"\n\nThe rest is still inside the archive, which has been partly emptied, so it needs to be finished." : L"\n\nThe archive itself is untouched.") +
-                         L"\n\nResume now?";
-        if (msg(t, MB_YESNO | MB_ICONQUESTION) == IDYES) startExtract(std::vector<std::string>(1, x.archive), x.eat);
-    }
+    refreshJobsButton();
+    if (IsWindowEnabled(g.jobsBtn)) showJobsWindow();
 }
 
 // ---------------------------------------------------------------- window
@@ -976,15 +984,186 @@ static LRESULT CALLBACK listSub(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, 
     return DefSubclassProc(h, m, wp, lp);
 }
 
+// ---------------------------------------------------------------- unfinished jobs
+static void refreshJobsButton() {
+    if (!g.jobsBtn) return;
+    size_t n = nz::pendingJobs().size() + nz::pendingExtractions().size();
+    SetWindowTextW(g.jobsBtn, n ? (L"Unfinished jobs (" + std::to_wstring(n) + L")").c_str() : L"No unfinished jobs");
+    EnableWindow(g.jobsBtn, n > 0 && !g.running);
+}
+enum { JB_LIST = 300, JB_HINT, JB_RESUME, JB_UNDO, JB_CLOSEASIS, JB_FORGET, JB_DONE };
+struct JobRow { bool extract = false; nz::JobInfo ji; nz::ExtractInfo xi; };
+struct JobsState { std::vector<JobRow> rows; int action = 0, index = -1; bool done = false; HWND list = nullptr, hint = nullptr; };
+static const wchar_t* kJobsClass = L"NibbleZipJobs";
+static int selectedRow(JobsState* st) { return st->list ? (int)SendMessageW(st->list, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED) : -1; }
+static void jobsUpdate(HWND h, JobsState* st) {
+    int i = selectedRow(st);
+    const JobRow* r = (i >= 0 && i < (int)st->rows.size()) ? &st->rows[i] : nullptr;
+    EnableWindow(GetDlgItem(h, JB_RESUME), r != nullptr);
+    EnableWindow(GetDlgItem(h, JB_UNDO), r && !r->extract && r->ji.midFile);
+    EnableWindow(GetDlgItem(h, JB_CLOSEASIS), r && !r->extract && !r->ji.midFile);
+    EnableWindow(GetDlgItem(h, JB_FORGET), r && r->extract && !r->xi.eat);
+    std::wstring t;
+    if (!r) t = L"Select a job to see what you can do with it.";
+    else if (r->extract && r->xi.eat)
+        t = L"Resume to finish extracting. The archive has been partly emptied as its files came out, so this extraction needs to be finished.";
+    else if (r->extract)
+        t = L"Resume to finish extracting, or Forget it. The archive was never changed; files extracted so far stay where they are.";
+    else if (r->ji.midFile)
+        t = L"Resume to finish the job, or Put the file back: “" + W(r->ji.midFileName) + L"” is restored exactly as it was and the archive is closed "
+            L"with the " + std::to_wstring(r->ji.filesDone) + L" file(s) stored before it.";
+    else
+        t = L"Resume to finish the job, or Close the archive as it is: it keeps the " + std::to_wstring(r->ji.filesDone) +
+            L" file(s) already stored, and the files not yet reached stay where they are.";
+    SetWindowTextW(st->hint, t.c_str());
+}
+static LRESULT CALLBACK jobsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    JobsState* st = (JobsState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_COMMAND:
+        if (!st || HIWORD(wp) != BN_CLICKED) break;
+        if (LOWORD(wp) == IDCANCEL || LOWORD(wp) == JB_DONE) { st->done = true; return 0; }
+        if (LOWORD(wp) == IDOK) { if (IsWindowEnabled(GetDlgItem(h, JB_RESUME))) { st->action = JB_RESUME; st->index = selectedRow(st); st->done = true; } return 0; }
+        if (LOWORD(wp) >= JB_RESUME && LOWORD(wp) <= JB_FORGET) { st->action = LOWORD(wp); st->index = selectedRow(st); st->done = true; return 0; }
+        break;
+    case WM_NOTIFY: {
+        NMHDR* n = (NMHDR*)lp;
+        if (st && n->idFrom == JB_LIST && n->code == LVN_ITEMCHANGED) jobsUpdate(h, st);
+        if (st && n->idFrom == JB_LIST && n->code == NM_DBLCLK && selectedRow(st) >= 0) { st->action = JB_RESUME; st->index = selectedRow(st); st->done = true; }
+        break;
+    }
+    case WM_CLOSE: if (st) st->done = true; return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+        SetTextColor((HDC)wp, T.text); SetBkColor((HDC)wp, T.bg);
+        return (LRESULT)T.brBg;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+static void showJobsWindow() {
+    if (g.running) return;
+    JobsState st;
+    for (auto& j : nz::pendingJobs()) { JobRow r; r.ji = j; st.rows.push_back(r); }
+    for (auto& x : nz::pendingExtractions()) { JobRow r; r.extract = true; r.xi = x; st.rows.push_back(r); }
+    if (st.rows.empty()) { refreshJobsButton(); msg(L"There are no unfinished jobs.", MB_OK | MB_ICONINFORMATION); return; }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc; memset(&wc, 0, sizeof(wc));
+        wc.cbSize = sizeof(wc); wc.lpfnWndProc = jobsProc; wc.hInstance = g.inst; wc.lpszClassName = kJobsClass;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = T.brBg;
+        RegisterClassExW(&wc); reg = true;
+    }
+    const int cw = S(620), ch = S(352), pad = S(16);
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT wr = {0, 0, cw, ch}; AdjustWindowRectEx(&wr, style, FALSE, WS_EX_DLGMODALFRAME);
+    int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
+    RECT orc; GetWindowRect(g.wnd, &orc);
+    int x = std::max(0L, orc.left + ((orc.right - orc.left) - ww) / 2), y = std::max(0L, orc.top + ((orc.bottom - orc.top) - wh) / 2);
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, kJobsClass, L"Unfinished jobs", style, x, y, ww, wh, g.wnd, nullptr, g.inst, nullptr);
+    if (!h) return;
+    SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)&st);
+    darkTitleBar(h);
+    auto add = [&](const wchar_t* cls, const wchar_t* text, DWORD sty, DWORD ex, int x0, int y0, int w0, int h0, int id) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | sty, x0, y0, w0, h0, h, (HMENU)(INT_PTR)id, g.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)g.font, TRUE);
+        return c;
+    };
+    add(L"STATIC", L"These jobs were stopped before they finished. Nothing in them is lost: choose one to carry on with it.", SS_NOPREFIX, 0, pad, pad, cw - 2 * pad, S(18), -1);
+    st.list = add(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | WS_TABSTOP, WS_EX_CLIENTEDGE, pad, pad + S(26), cw - 2 * pad, S(170), JB_LIST);
+    SendMessageW(st.list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    const wchar_t* cols[3] = {L"Job", L"Archive", L"Where it stopped"}; int widths[3] = {72, 250, 262};
+    for (int i = 0; i < 3; i++) {
+        LVCOLUMNW c; memset(&c, 0, sizeof(c));
+        c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM; c.pszText = (LPWSTR)cols[i]; c.cx = S(widths[i]); c.iSubItem = i;
+        SendMessageW(st.list, LVM_INSERTCOLUMNW, i, (LPARAM)&c);
+    }
+    for (size_t i = 0; i < st.rows.size(); i++) {
+        const JobRow& r = st.rows[i];
+        std::wstring kind = r.extract ? L"Extract" : L"Compress", arc = W(r.extract ? r.xi.archive : r.ji.archive), where;
+        if (r.extract) where = L"into " + W(plat::baseName(r.xi.dest)) + (r.xi.eat ? L", archive partly emptied" : L", archive untouched");
+        else if (r.ji.midFile) where = std::to_wstring(r.ji.filesDone) + L" stored, part-way through " + W(r.ji.midFileName);
+        else where = std::to_wstring(r.ji.filesDone) + L" file(s) stored";
+        LVITEMW it; memset(&it, 0, sizeof(it));
+        it.mask = LVIF_TEXT; it.iItem = (int)i; it.pszText = (LPWSTR)kind.c_str();
+        int idx = (int)SendMessageW(st.list, LVM_INSERTITEMW, 0, (LPARAM)&it);
+        it.iItem = idx; it.iSubItem = 1; it.pszText = (LPWSTR)arc.c_str(); SendMessageW(st.list, LVM_SETITEMW, 0, (LPARAM)&it);
+        it.iSubItem = 2; it.pszText = (LPWSTR)where.c_str(); SendMessageW(st.list, LVM_SETITEMW, 0, (LPARAM)&it);
+    }
+    if (T.dark) {
+        SendMessageW(st.list, LVM_SETBKCOLOR, 0, (LPARAM)T.ctl);
+        SendMessageW(st.list, LVM_SETTEXTBKCOLOR, 0, (LPARAM)T.ctl);
+        SendMessageW(st.list, LVM_SETTEXTCOLOR, 0, (LPARAM)T.text);
+        SetWindowSubclass(st.list, listSub, 1, 0);
+        darken(st.list, L"DarkMode_Explorer");
+        darken((HWND)SendMessageW(st.list, LVM_GETHEADER, 0, 0), L"ItemsView");
+    }
+    st.hint = add(L"STATIC", L"", SS_NOPREFIX, 0, pad, pad + S(206), cw - 2 * pad, S(54), JB_HINT);
+    struct B { int id; const wchar_t* label; int w; };
+    B bs[5] = {{JB_RESUME, L"Resume", 92}, {JB_UNDO, L"Put the file back", 128}, {JB_CLOSEASIS, L"Close the archive as it is", 168}, {JB_FORGET, L"Forget", 72}, {JB_DONE, L"Close", 84}};
+    int bx = pad, by = ch - pad - S(28);
+    for (int i = 0; i < 5; i++) {
+        if (i == 4) bx = cw - pad - S(bs[i].w);
+        HWND b = add(L"BUTTON", bs[i].label, WS_TABSTOP | (i == 0 ? BS_DEFPUSHBUTTON : 0), 0, bx, by, S(bs[i].w), S(28), bs[i].id);
+        darken(b, L"DarkMode_Explorer");
+        bx += S(bs[i].w) + S(8);
+    }
+    LVITEMW sel; memset(&sel, 0, sizeof(sel)); sel.stateMask = LVIS_SELECTED | LVIS_FOCUSED; sel.state = LVIS_SELECTED | LVIS_FOCUSED;
+    SendMessageW(st.list, LVM_SETITEMSTATE, 0, (LPARAM)&sel);
+    jobsUpdate(h, &st);
+    EnableWindow(g.wnd, FALSE);
+    ShowWindow(h, SW_SHOW);
+    SetFocus(st.list);
+    MSG mm;
+    while (!st.done) {
+        BOOL r = GetMessageW(&mm, nullptr, 0, 0);
+        if (r <= 0) { if (r == 0) PostQuitMessage((int)mm.wParam); break; }
+        if (IsDialogMessageW(h, &mm)) continue;
+        TranslateMessage(&mm);
+        DispatchMessageW(&mm);
+    }
+    EnableWindow(g.wnd, TRUE);
+    SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+    DestroyWindow(h);
+    SetForegroundWindow(g.wnd);
+    if (st.index < 0 || st.index >= (int)st.rows.size() || !st.action) { refreshJobsButton(); return; }
+    const JobRow& r = st.rows[st.index];
+    switch (st.action) {
+    case JB_RESUME:
+        if (r.extract) startExtract(std::vector<std::string>(1, r.xi.archive), r.xi.eat);
+        else startJob(r.ji.opt);
+        break;
+    case JB_UNDO: startUndo(r.ji.archive); break;
+    case JB_CLOSEASIS: { nz::Options o = r.ji.opt; o.finalizeOnly = true; startJob(o); break; }
+    case JB_FORGET:
+        if (!nz::forgetExtraction(r.xi.archive)) msg(L"That job could not be forgotten.", MB_OK | MB_ICONWARNING);
+        refreshJobsButton();
+        break;
+    }
+}
+static void showMoreMenu() {
+    HMENU m = CreatePopupMenu(), th = CreatePopupMenu();
+    AppendMenuW(th, MF_STRING | (T.pref == 0 ? MF_CHECKED : 0), ID_THEME_AUTO, L"Follow Windows");
+    AppendMenuW(th, MF_STRING | (T.pref == 1 ? MF_CHECKED : 0), ID_THEME_LIGHT, L"Light");
+    AppendMenuW(th, MF_STRING | (T.pref == 2 ? MF_CHECKED : 0), ID_THEME_DARK, L"Dark");
+    AppendMenuW(m, MF_STRING, ID_LOG, L"Deletion log");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)th, L"Theme");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, ID_ABOUT, L"About NibbleZip");
+    RECT r; GetWindowRect(g.moreBtn, &r);
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN, r.right, r.bottom, 0, g.wnd, nullptr);
+    DestroyMenu(m);
+    if (cmd) PostMessageW(g.wnd, WM_COMMAND, MAKEWPARAM(cmd, BN_CLICKED), 0);
+}
+
 static void createControls() {
     ensureFonts();
     const int M = 20, CW = 640 - 2 * M;
     HWND title = mk(L"STATIC", L"NibbleZip", 0, 0, M, 14, 150, 30, -1);
-    g.extractBtn = mk(L"BUTTON", L"Extract…", WS_TABSTOP, 0, M + CW - 96 - 8 - 134 - 8 - 96 - 8 - 86, 14, 86, 26, ID_EXTRACT);
-    g.logBtn = mk(L"BUTTON", L"Deletion log", WS_TABSTOP, 0, M + CW - 96 - 8 - 134 - 8 - 96, 14, 96, 26, ID_LOG);
     SendMessageW(title, WM_SETFONT, (WPARAM)g.fontBig, TRUE);
-    g.verifyBtn = mk(L"BUTTON", L"Check an archive…", WS_TABSTOP, 0, M + CW - 96 - 8 - 134, 14, 134, 26, ID_VERIFY);
-    g.themeBtn = mk(L"BUTTON", themeLabel(), WS_TABSTOP, 0, M + CW - 96, 14, 96, 26, ID_THEME);
+    g.moreBtn = mk(L"BUTTON", L"More", WS_TABSTOP, 0, M + CW - 76, 14, 76, 26, ID_MORE);
+    g.verifyBtn = mk(L"BUTTON", L"Check an archive\u2026", WS_TABSTOP, 0, M + CW - 76 - 8 - 134, 14, 134, 26, ID_VERIFY);
+    g.extractBtn = mk(L"BUTTON", L"Extract\u2026", WS_TABSTOP, 0, M + CW - 76 - 8 - 134 - 8 - 86, 14, 86, 26, ID_EXTRACT);
+    g.jobsBtn = mk(L"BUTTON", L"No unfinished jobs", WS_TABSTOP, 0, M + CW - 76 - 8 - 134 - 8 - 86 - 8 - 136, 14, 136, 26, ID_JOBS);
     mk(L"STATIC", L"Compresses files and frees up their space as it goes, so you don't need room for both.", 0, 0, M, 46, CW, 18, -1);
 
     g.list = mk(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | WS_TABSTOP, WS_EX_CLIENTEDGE, M, 74, CW, 170, ID_LIST);
@@ -1054,8 +1233,8 @@ static void createControls() {
     g.pause = mk(L"BUTTON", L"Pause", WS_TABSTOP, 0, M + CW - 268, 588, 130, 30, ID_PAUSE);
     g.stop = mk(L"BUTTON", L"Stop…", WS_TABSTOP, 0, M + CW - 130, 588, 130, 30, ID_STOP);
     if (T.dark) {
-        darken(g.output, L"DarkMode_CFD"); darken(g.logBtn, L"DarkMode_Explorer"); darken(g.extractBtn, L"DarkMode_Explorer"); darken(g.split, L"DarkMode_CFD");
-        HWND btns[] = {g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.start, g.pause, g.stop, g.verifyBtn, g.themeBtn, g.eat};
+        darken(g.output, L"DarkMode_CFD"); darken(g.jobsBtn, L"DarkMode_Explorer"); darken(g.moreBtn, L"DarkMode_Explorer"); darken(g.extractBtn, L"DarkMode_Explorer"); darken(g.split, L"DarkMode_CFD");
+        HWND btns[] = {g.addFiles, g.addFolder, g.removeBtn, g.clearBtn, g.browse, g.menuBtn, g.start, g.pause, g.stop, g.verifyBtn, g.eat};
         for (HWND b : btns) darken(b, L"DarkMode_Explorer");
         darken(g.format, L"DarkMode_CFD"); darken(g.level, L"DarkMode_CFD"); darken(g.archive, L"DarkMode_CFD");
         SetWindowTheme(g.bar, L"", L"");
@@ -1093,10 +1272,14 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             else ShellExecuteW(g.wnd, L"open", L"notepad.exe", (L"\"" + W(lp) + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
             return 0;
         }
-        case ID_THEME:
-            T.pref = (T.pref + 1) % 3; regSet(L"Theme", (DWORD)T.pref);
-            relaunch();   // the theme is applied when the window is built
+        case ID_THEME_AUTO: case ID_THEME_LIGHT: case ID_THEME_DARK: {
+            int want = id - ID_THEME_AUTO;
+            if (want != T.pref) { T.pref = want; regSet(L"Theme", (DWORD)T.pref); relaunch(); }   // the theme is applied when the window is built
             return 0;
+        }
+        case ID_MORE: showMoreMenu(); return 0;
+        case ID_JOBS: showJobsWindow(); return 0;
+        case ID_ABOUT: showAbout(); return 0;
         case ID_STOP: onStop(); return 0;
         case ID_PAUSE: {
             bool p = !g.pauseFlag.load(); g.pauseFlag = p;

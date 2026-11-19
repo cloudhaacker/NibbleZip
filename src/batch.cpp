@@ -28,7 +28,7 @@ static void walkFiles(const std::string& dir, const std::string& destDir, bool m
         std::string p = plat::join(dir, e.name);
         if (e.st.isLink) continue;
         if (e.st.isDir) { walkFiles(p, mirror ? plat::join(destDir, e.name) : p, mirror, ext, out, skippedSameType); continue; }
-        if (endsWith(e.name, ".nzj")) continue;
+        if (endsWith(e.name, ".nzj") || endsWith(e.name, ".nzx")) continue;
         if (endsWith(e.name, ext)) { skippedSameType++; continue; }
         Cand c; c.src = p; c.destDir = destDir; c.full = e.name; c.stem = stemOf(e.name); c.bytes = e.st.size;
         out.push_back(std::move(c));
