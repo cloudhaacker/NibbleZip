@@ -28,7 +28,7 @@
 
 static const wchar_t* kClass = L"NibbleZipMainWindow";
 static const wchar_t* kTitle = L"NibbleZip";
-static const wchar_t* kVersion = L"0.9.1";
+static const wchar_t* kVersion = L"0.9.2";
 static const DWORD kDisclaimerVersion = 2;   // raise to show the disclaimer again after its text changes
 static const wchar_t* kMenuText = L"Compress and reclaim space (NibbleZip)";
 #define WM_NZ_PROGRESS (WM_APP + 1)
@@ -443,6 +443,35 @@ static int archiveKind(const std::string& path) {
     return n.compare(dot, 4, ".001") == 0 ? 1 : 2;
 }
 static std::string firstPartOf(const std::string& path) { return path.substr(0, path.size() - 4) + ".001"; }
+// Total size and number of parts of a split archive, given its .001 part.
+static uint64_t splitInfo(const std::string& first, int& parts) {
+    uint64_t t = 0; std::string base = first.substr(0, first.size() - 4); plat::Stat st; parts = 0;
+    for (int i = 1; i < 100000; i++) {
+        char suf[16]; snprintf(suf, sizeof(suf), ".%03d", i);
+        if (!plat::stat(base + suf, st)) break;
+        t += st.size; parts++;
+    }
+    return t;
+}
+static bool isFirstPart(const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".001") == 0; }
+// What the Size column shows: in Extract mode a split archive is shown as a whole.
+static std::wstring sizeText(const std::string& p) {
+    plat::Stat st;
+    if (!plat::stat(p, st)) return L"";
+    if (st.isDir) return L"Folder";
+    if (g.mode == 1 && isFirstPart(p) && archiveKind(p) == 1) {
+        int parts = 0; uint64_t t = splitInfo(p, parts);
+        return W(nz::humanSize(t)) + L" (" + std::to_wstring(parts) + L" parts)";
+    }
+    return W(nz::humanSize(st.size));
+}
+static void refreshSizes() {
+    for (size_t i = 0; i < g.items.size(); i++) {
+        std::wstring t = sizeText(g.items[i]);
+        LVITEMW it; memset(&it, 0, sizeof(it)); it.iSubItem = 1; it.pszText = (LPWSTR)t.c_str();
+        SendMessageW(g.list, LVM_SETITEMTEXTW, i, (LPARAM)&it);
+    }
+}
 static void collectArchives(const std::string& dir, std::vector<std::string>& out, int depth = 0) {
     std::vector<plat::DirEnt> ents;
     if (depth > 32 || !plat::listDir(dir, ents)) return;
@@ -490,6 +519,7 @@ static void setMode(int m, bool chosen) {
         SetWindowTextW(g.addFiles, L"Add archives\u2026");
     }
     InvalidateRect(g.wnd, nullptr, TRUE);
+    refreshSizes();
     updateAutoName(); updateInfo();
 }
 static void updateAutoName() {
@@ -534,7 +564,7 @@ static void addItem(const std::string& raw) {
     for (auto& x : g.items) if (plat::samePath(x, p)) return;
     g.items.push_back(p);
     LVITEMW it; memset(&it, 0, sizeof(it));
-    std::wstring name = W(plat::baseName(p)), size = st.isDir ? L"Folder" : W(nz::humanSize(st.size)), loc = W(plat::parentDir(p));
+    std::wstring name = W(plat::baseName(p)), size = sizeText(p), loc = W(plat::parentDir(p));
     it.mask = LVIF_TEXT; it.iItem = (int)g.items.size() - 1; it.pszText = (LPWSTR)name.c_str();
     int idx = (int)SendMessageW(g.list, LVM_INSERTITEMW, 0, (LPARAM)&it);
     it.iItem = idx; it.iSubItem = 1; it.pszText = (LPWSTR)size.c_str(); SendMessageW(g.list, LVM_SETITEMW, 0, (LPARAM)&it);
@@ -731,15 +761,7 @@ struct XCb : GuiCb {
     void progress(const nz::Progress& p) override { nz::Progress q = p; q.jobIndex = idx; q.jobCount = count; GuiCb::progress(q); }
 };
 struct XJob { std::string archive, dest; };
-static uint64_t splitTotal(const std::string& first) {
-    uint64_t t = 0; std::string base = first.substr(0, first.size() - 4); plat::Stat st;
-    for (int i = 1; i < 100000; i++) {
-        char suf[16]; snprintf(suf, sizeof(suf), ".%03d", i);
-        if (!plat::stat(base + suf, st)) break;
-        t += st.size;
-    }
-    return t;
-}
+static uint64_t splitTotal(const std::string& first) { int n = 0; return splitInfo(first, n); }
 static void startExtract(const std::vector<XJob>& jobs, bool eat) {
     if (g.worker.joinable()) g.worker.join();
     g.stopReq = 0; g.pauseFlag = false; g.haveStart = false;
@@ -1146,6 +1168,7 @@ static void jobsUpdate(HWND h, JobsState* st) {
     else
         t = L"Resume to finish the job, or Close the archive as it is: it keeps the " + std::to_wstring(r->ji.filesDone) +
             L" file(s) already stored, and the files not yet reached stay where they are.";
+    if (r) t = L"Archive: " + W(r->extract ? r->xi.archive : r->ji.archive) + L"\n" + t;
     SetWindowTextW(st->hint, t.c_str());
 }
 static LRESULT CALLBACK jobsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -1184,7 +1207,7 @@ static void showJobsWindow() {
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = T.brBg;
         RegisterClassExW(&wc); reg = true;
     }
-    const int cw = S(620), ch = S(352), pad = S(16);
+    const int cw = S(620), ch = S(368), pad = S(16);
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     RECT wr = {0, 0, cw, ch}; AdjustWindowRectEx(&wr, style, FALSE, WS_EX_DLGMODALFRAME);
     int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
@@ -1202,7 +1225,7 @@ static void showJobsWindow() {
     add(L"STATIC", L"These jobs were stopped before they finished. Nothing in them is lost: choose one to carry on with it.", SS_NOPREFIX, 0, pad, pad, cw - 2 * pad, S(18), -1);
     st.list = add(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | WS_TABSTOP, WS_EX_CLIENTEDGE, pad, pad + S(26), cw - 2 * pad, S(170), JB_LIST);
     SendMessageW(st.list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-    const wchar_t* cols[3] = {L"Job", L"Archive", L"Where it stopped"}; int widths[3] = {72, 250, 262};
+    const wchar_t* cols[3] = {L"Job", L"Archive", L"Where it stopped"}; int widths[3] = {72, 230, 282};
     for (int i = 0; i < 3; i++) {
         LVCOLUMNW c; memset(&c, 0, sizeof(c));
         c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM; c.pszText = (LPWSTR)cols[i]; c.cx = S(widths[i]); c.iSubItem = i;
@@ -1210,7 +1233,7 @@ static void showJobsWindow() {
     }
     for (size_t i = 0; i < st.rows.size(); i++) {
         const JobRow& r = st.rows[i];
-        std::wstring kind = r.extract ? L"Extract" : L"Compress", arc = W(r.extract ? r.xi.archive : r.ji.archive), where;
+        std::wstring kind = r.extract ? L"Extract" : L"Compress", arc = W(plat::baseName(r.extract ? r.xi.archive : r.ji.archive)), where;
         if (r.extract) where = L"into " + W(plat::baseName(r.xi.dest)) + (r.xi.eat ? L", archive partly emptied" : L", archive untouched");
         else if (r.ji.midFile) where = std::to_wstring(r.ji.filesDone) + L" stored, part-way through " + W(r.ji.midFileName);
         else where = std::to_wstring(r.ji.filesDone) + L" file(s) stored";
@@ -1228,7 +1251,7 @@ static void showJobsWindow() {
         darken(st.list, L"DarkMode_Explorer");
         darken((HWND)SendMessageW(st.list, LVM_GETHEADER, 0, 0), L"ItemsView");
     }
-    st.hint = add(L"STATIC", L"", SS_NOPREFIX, 0, pad, pad + S(206), cw - 2 * pad, S(54), JB_HINT);
+    st.hint = add(L"STATIC", L"", SS_NOPREFIX, 0, pad, pad + S(204), cw - 2 * pad, S(70), JB_HINT);
     struct B { int id; const wchar_t* label; int w; };
     B bs[5] = {{JB_RESUME, L"Resume", 92}, {JB_UNDO, L"Put the file back", 128}, {JB_CLOSEASIS, L"Close the archive as it is", 168}, {JB_FORGET, L"Forget", 72}, {JB_DONE, L"Close", 84}};
     int bx = pad, by = ch - pad - S(28);
@@ -1300,7 +1323,7 @@ static void createControls() {
 
     g.list = mk(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | WS_TABSTOP, WS_EX_CLIENTEDGE, M, 78, CW, 166, ID_LIST);
     SendMessageW(g.list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-    const wchar_t* cols[3] = {L"Name", L"Size", L"Location"}; int widths[3] = {230, 90, 255};
+    const wchar_t* cols[3] = {L"Name", L"Size", L"Location"}; int widths[3] = {220, 124, 231};
     for (int i = 0; i < 3; i++) {
         LVCOLUMNW c; memset(&c, 0, sizeof(c));
         c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM; c.pszText = (LPWSTR)cols[i]; c.cx = S(widths[i]); c.iSubItem = i;
